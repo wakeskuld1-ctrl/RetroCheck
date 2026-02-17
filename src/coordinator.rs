@@ -8,32 +8,38 @@ use crate::pb::database_service_client::DatabaseServiceClient;
 // - 原因: 需要使用一致性模式计算所需法定人数
 // - 目的: 清理无用依赖保持构建干净
 use crate::pb::{
-    ExecuteRequest, PrepareRequest, CommitRequest, RollbackRequest, GetVersionRequest
+    CommitRequest, ExecuteRequest, GetVersionRequest, PrepareRequest, RollbackRequest,
 };
 // ### 修改记录 (2026-02-17)
 // - 原因: 在库 crate 内使用包名路径导致模块无法解析
 // - 目的: 将 ConsistencyMode 引入以消除未使用字段告警
 use crate::config::{ClusterConfig, ConsistencyMode};
-use tonic::transport::Channel;
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
+use std::collections::{HashMap, VecDeque};
+use tonic::transport::Channel;
 use uuid::Uuid;
-// ### 修改记录 (2026-02-17)
-// - 原因: HashMap 未使用导致编译警告
-// - 目的: 清理无用依赖保持构建干净
+
+const TX_REGISTRY_LIMIT: usize = 128;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxState {
+    InProgress,
+    Committed,
+}
 
 /// MultiDbCoordinator: Distributed Transaction Coordinator
-/// 
+///
 /// This struct is responsible for orchestrating distributed transactions across
 /// a cluster of database nodes (Master and Slaves). It implements a Quorum-based
 /// consistency protocol to ensure data integrity even in the presence of node failures.
-/// 
+///
 /// Key Responsibilities:
 /// 1. Connection Management: Maintains gRPC connections to all cluster nodes.
 /// 2. Transaction Orchestration: Manages the Two-Phase Commit (2PC) protocol.
 /// 3. Consistency Enforcement: Enforces Quorum (N/2 + 1) rules for commits.
 /// 4. Failure Handling: Rollbacks transactions if Quorum is not met.
-/// 
+///
 /// Architecture Note:
 /// We use the Actor model implicitly here by treating each remote node as an actor
 /// that we send messages to (Prepare, Commit, Rollback). The coordinator itself
@@ -53,6 +59,8 @@ pub struct MultiDbCoordinator {
     // - 原因: 需要记录已提交事务用于故障后补齐
     // - 目的: 提供最小可行的事务回放能力
     committed_history: Vec<CommittedTx>,
+    tx_registry: HashMap<String, TxState>,
+    tx_order: VecDeque<String>,
 }
 
 // ### 修改记录 (2026-02-17)
@@ -72,28 +80,36 @@ struct CommittedTx {
 
 impl MultiDbCoordinator {
     /// Creates a new Coordinator instance and establishes connections to all nodes.
-    /// 
+    ///
     /// This is an async constructor because establishing network connections (gRPC)
     /// requires awaiting the handshake.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `config` - Cluster configuration containing Master/Slave addresses.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Result<Self>` - Connected coordinator or error if connections fail.
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要从调用端透传提交前暂停参数
     // - 目的: 允许验证脚本在 2PC 间隙插入宕机
     pub async fn new(config: ClusterConfig, pause_before_commit_ms: Option<u64>) -> Result<Self> {
-        // Connect to Master node. 
+        // Connect to Master node.
         // We fail fast if the Master is unreachable as it's critical for the cluster.
         // ### 修改记录 (2026-02-17)
         // - 原因: gRPC Client 泛型类型推断失败导致编译错误
         // - 目的: 明确指定 Channel 类型，稳定类型推断
-        let master_client: DatabaseServiceClient<Channel> = DatabaseServiceClient::connect(config.master_addr.clone()).await
-            .map_err(|e| anyhow!("Failed to connect to master at {}: {}", config.master_addr, e))?;
+        let master_client: DatabaseServiceClient<Channel> =
+            DatabaseServiceClient::connect(config.master_addr.clone())
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to connect to master at {}: {}",
+                        config.master_addr,
+                        e
+                    )
+                })?;
 
         // Connect to all Slave nodes.
         // In a more robust implementation, we might allow partial startup if Quorum is met,
@@ -103,8 +119,10 @@ impl MultiDbCoordinator {
             // ### 修改记录 (2026-02-17)
             // - 原因: 循环内 Client 泛型类型推断失败
             // - 目的: 明确指定 Channel 类型，避免编译器无法推断
-            let client: DatabaseServiceClient<Channel> = DatabaseServiceClient::connect(addr.clone()).await
-                .map_err(|e| anyhow!("Failed to connect to slave at {}: {}", addr, e))?;
+            let client: DatabaseServiceClient<Channel> =
+                DatabaseServiceClient::connect(addr.clone())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect to slave at {}: {}", addr, e))?;
             slave_clients.push(client);
         }
 
@@ -120,6 +138,8 @@ impl MultiDbCoordinator {
             // - 原因: 默认不开启提交前暂停
             // - 目的: 只有显式指定时才进行等待
             pause_before_commit_ms,
+            tx_registry: HashMap::new(),
+            tx_order: VecDeque::new(),
         })
     }
 
@@ -140,10 +160,10 @@ impl MultiDbCoordinator {
     // - 原因: 节点恢复后缺乏可重放事务
     // - 目的: 记录已提交事务以支持补齐
     fn record_committed_tx(&mut self, sql: &str, args: &[String]) {
-        // ### 修改记录 (2026-02-17)
-        // - 原因: 需要控制历史记录长度避免无限增长
-        // - 目的: 保持固定窗口以平衡内存与恢复能力
-        let history_limit = 32;
+        let history_limit = self.config.committed_history_limit;
+        if history_limit == 0 {
+            return;
+        }
         self.committed_history.push(CommittedTx {
             sql: sql.to_string(),
             args: args.to_vec(),
@@ -182,7 +202,9 @@ impl MultiDbCoordinator {
                 let prepare_res = client.prepare(prepare_req).await;
                 if prepare_res.is_err() {
                     let _ = client
-                        .rollback(RollbackRequest { tx_id: tx_id.clone() })
+                        .rollback(RollbackRequest {
+                            tx_id: tx_id.clone(),
+                        })
                         .await;
                     return Err(anyhow!("Replay prepare failed on node {}", idx));
                 }
@@ -196,32 +218,44 @@ impl MultiDbCoordinator {
     }
 
     /// Executes a schema migration (DDL) across the cluster.
-    /// 
+    ///
     /// Schema changes are particularly risky in distributed systems because they can't
     /// always be easily rolled back. This implementation uses a "Best Effort" approach:
     /// it tries to apply the change to Master first, then all Slaves.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `sql` - The DDL SQL statement (e.g., CREATE TABLE).
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Result<()>` - Ok if at least Master succeeded, but logs errors for Slaves.
     pub async fn execute_schema_migration(&mut self, sql: &str) -> Result<()> {
         // Schema changes are tricky in distributed systems.
         // For simplicity, we try to execute on all nodes. If one fails, we report error.
         // In production, this should be more robust (e.g. idempotent scripts, version tracking).
-        
+
         println!("Migration: Executing on Master...");
         // Critical: If Master fails, we abort immediately.
-        self.master_client.execute(ExecuteRequest { sql: sql.to_string() }).await?;
+        self.master_client
+            .execute(ExecuteRequest {
+                sql: sql.to_string(),
+            })
+            .await?;
 
-        println!("Migration: Executing on {} Slaves...", self.slave_clients.len());
+        println!(
+            "Migration: Executing on {} Slaves...",
+            self.slave_clients.len()
+        );
         // We execute on slaves sequentially here for simplicity, but parallel is also possible.
         // Parallel execution would speed up large clusters.
         for (i, client) in self.slave_clients.iter_mut().enumerate() {
-            match client.execute(ExecuteRequest { sql: sql.to_string() }).await {
+            match client
+                .execute(ExecuteRequest {
+                    sql: sql.to_string(),
+                })
+                .await
+            {
                 Ok(_) => println!("  Slave {} migrated.", i),
                 Err(e) => println!("  Slave {} migration failed: {}", i, e),
             }
@@ -230,30 +264,86 @@ impl MultiDbCoordinator {
     }
 
     /// Executes an Atomic Write Transaction across the cluster.
-    /// 
+    ///
     /// This is the core of the distributed system. It implements a Two-Phase Commit (2PC)
     /// protocol with Quorum consistency checks.
-    /// 
+    ///
     /// Steps:
     /// 1. Generate a global Transaction ID (UUID).
     /// 2. Phase 1 (Prepare): Send SQL to all nodes. Nodes lock resources and validate.
     /// 3. Quorum Check: Ensure (N/2 + 1) nodes successfully Prepared.
-    /// 4. Phase 2 (Commit/Rollback): 
+    /// 4. Phase 2 (Commit/Rollback):
     ///    - If Quorum reached: Send Commit to prepared nodes.
     ///    - If Quorum failed: Send Rollback to prepared nodes.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `sql` - The SQL INSERT/UPDATE/DELETE statement.
     /// * `args` - Parameters for the SQL statement (to avoid SQL injection).
     pub async fn atomic_write(&mut self, sql: &str, args: Vec<String>) -> Result<()> {
         let tx_id = Uuid::new_v4().to_string();
+        self.atomic_write_with_tx_id(&tx_id, sql, args).await
+    }
+
+    pub async fn atomic_write_with_tx_id(
+        &mut self,
+        tx_id: &str,
+        sql: &str,
+        args: Vec<String>,
+    ) -> Result<()> {
+        if let Some(state) = self.tx_registry.get(tx_id) {
+            if *state == TxState::Committed {
+                return Ok(());
+            }
+            return Err(anyhow!("Transaction already in progress"));
+        }
+
+        self.tx_registry
+            .insert(tx_id.to_string(), TxState::InProgress);
+        self.tx_order.push_back(tx_id.to_string());
+        self.trim_tx_registry();
+
+        let result = self.atomic_write_internal(tx_id, sql, args).await;
+        match result {
+            Ok(_) => {
+                self.tx_registry
+                    .insert(tx_id.to_string(), TxState::Committed);
+                Ok(())
+            }
+            Err(err) => {
+                self.tx_registry.remove(tx_id);
+                self.tx_order.retain(|id| id != tx_id);
+                Err(err)
+            }
+        }
+    }
+
+    fn trim_tx_registry(&mut self) {
+        while self.tx_order.len() > TX_REGISTRY_LIMIT {
+            if let Some(tx_id) = self.tx_order.pop_front() {
+                if let Some(state) = self.tx_registry.get(&tx_id) {
+                    if *state == TxState::InProgress {
+                        self.tx_order.push_back(tx_id);
+                        break;
+                    }
+                }
+                self.tx_registry.remove(&tx_id);
+            }
+        }
+    }
+
+    async fn atomic_write_internal(
+        &mut self,
+        tx_id: &str,
+        sql: &str,
+        args: Vec<String>,
+    ) -> Result<()> {
         println!("Starting transaction {} with Quorum check...", tx_id);
 
         // Phase 1: Prepare
         // We construct the request once and clone it for each node.
         let prepare_req = PrepareRequest {
-            tx_id: tx_id.clone(),
+            tx_id: tx_id.to_string(),
             sql: sql.to_string(),
             args: args.clone(),
         };
@@ -264,26 +354,27 @@ impl MultiDbCoordinator {
         // Since `self.master_client` and `self.slave_clients` are separate fields,
         // and we can't borrow `self` mutably twice, we clone the clients.
         // Tonic clients are cheap to clone (they are just handles to a channel).
-        
+
         let mut all_clients = vec![self.master_client.clone()];
         all_clients.extend(self.slave_clients.iter().cloned());
-        
+
         let total_nodes = all_clients.len();
         // ### 修改记录 (2026-02-17)
         // - 原因: 原逻辑固定使用 Quorum 计算
         // - 目的: 根据配置的模式计算所需法定人数
         let required_quorum = self.required_quorum(total_nodes);
-        
-        println!("  Phase 1: Prepare (Target Quorum: {}/{})", required_quorum, total_nodes);
+
+        println!(
+            "  Phase 1: Prepare (Target Quorum: {}/{})",
+            required_quorum, total_nodes
+        );
 
         // Execute Prepare in PARALLEL using Tokio tasks.
         // This significantly reduces latency compared to sequential execution.
         let mut prepare_futures = Vec::new();
         for mut client in all_clients.clone() {
             let req = prepare_req.clone();
-            prepare_futures.push(async move {
-                client.prepare(req).await
-            });
+            prepare_futures.push(async move { client.prepare(req).await });
         }
 
         // Wait for all Prepare responses
@@ -291,7 +382,7 @@ impl MultiDbCoordinator {
         // - 原因: 编译器无法推断 join_all 返回的具体类型
         // - 目的: 显式标注结果为 Vec 以稳定类型推断
         let results: Vec<_> = join_all(prepare_futures).await;
-        
+
         let mut success_count = 0;
         // We track which nodes succeeded so we know who to Commit/Rollback later.
         let mut prepared_indices = Vec::new();
@@ -307,18 +398,20 @@ impl MultiDbCoordinator {
 
         // Decision Point: Quorum Check
         if success_count < required_quorum {
-            println!("  Quorum failed ({} < {}). Rolling back prepared nodes...", success_count, required_quorum);
-            
+            println!(
+                "  Quorum failed ({} < {}). Rolling back prepared nodes...",
+                success_count, required_quorum
+            );
+
             // Rollback only prepared nodes.
             // Nodes that failed prepare presumably didn't lock anything or already failed.
             // (In a stricter impl, we might try to rollback everyone just in case).
             let mut rollback_futures = Vec::new();
             for i in prepared_indices {
                 let mut client = all_clients[i].clone();
-                let tid = tx_id.clone();
-                rollback_futures.push(async move {
-                    client.rollback(RollbackRequest { tx_id: tid }).await
-                });
+            let tid = tx_id.to_string();
+                rollback_futures
+                    .push(async move { client.rollback(RollbackRequest { tx_id: tid }).await });
             }
             join_all(rollback_futures).await;
             return Err(anyhow!("Quorum not reached during Prepare phase"));
@@ -328,32 +421,33 @@ impl MultiDbCoordinator {
         // ### 修改记录 (2026-02-17)
         // - 原因: 需要在 Prepare 与 Commit 之间留出故障注入窗口
         // - 目的: 允许脚本在暂停期内终止节点进程
-        if let Some(ms) = self.pause_before_commit_ms {
-            if ms > 0 {
-                println!("  Pause Before Commit: {} ms", ms);
-                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-            }
+        // ### 修改记录 (2026-02-17)
+        // - 原因: clippy 指出可折叠的 if 嵌套
+        // - 目的: 降低缩进层级并保持控制流清晰
+        if let Some(ms) = self.pause_before_commit_ms
+            && ms > 0
+        {
+            println!("  Pause Before Commit: {} ms", ms);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
 
         // Phase 2: Commit
         // We only send Commit to nodes that successfully Prepared.
         // Nodes that failed Prepare are assumed to be out of sync or offline for this Tx.
         // They will need catch-up/replication later (not implemented here).
-        
+
         let mut commit_futures = Vec::new();
         for i in prepared_indices {
             let mut client = all_clients[i].clone();
-            let tid = tx_id.clone();
-            commit_futures.push(async move {
-                client.commit(CommitRequest { tx_id: tid }).await
-            });
+            let tid = tx_id.to_string();
+            commit_futures.push(async move { client.commit(CommitRequest { tx_id: tid }).await });
         }
 
         // ### 修改记录 (2026-02-17)
         // - 原因: 编译器无法推断 join_all 返回的具体类型
         // - 目的: 显式标注结果为 Vec 以稳定类型推断
         let commit_results: Vec<_> = join_all(commit_futures).await;
-        
+
         // Verify Commit Success
         let mut commit_success = 0;
         for res in commit_results {
@@ -366,12 +460,17 @@ impl MultiDbCoordinator {
         // If we lose Quorum during Commit (e.g., nodes crash after Prepare but before Commit),
         // we are in a dangerous state (Partial Commit).
         if commit_success < required_quorum {
-             // This is a critical failure state (Inconsistent state).
-             // In production, we'd need manual intervention or complex recovery (WAL replay).
-             return Err(anyhow!("Critical: Quorum lost during Commit phase! Data may be inconsistent."));
+            // This is a critical failure state (Inconsistent state).
+            // In production, we'd need manual intervention or complex recovery (WAL replay).
+            return Err(anyhow!(
+                "Critical: Quorum lost during Commit phase! Data may be inconsistent."
+            ));
         }
 
-        println!("Transaction {} Committed Successfully on {} nodes.", tx_id, commit_success);
+        println!(
+            "Transaction {} Committed Successfully on {} nodes.",
+            tx_id, commit_success
+        );
         // ### 修改记录 (2026-02-17)
         // - 原因: 节点重启后缺乏补齐依据
         // - 目的: 在提交成功后记录可回放的事务
@@ -380,23 +479,25 @@ impl MultiDbCoordinator {
     }
 
     /// Verifies data consistency across the cluster.
-    /// 
+    ///
     /// It queries the `version` column (or equivalent) from all nodes and checks
     /// if they match. This is useful for monitoring and verifying the system state.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `table` - The table to check consistency for.
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Result<()>` - Ok if all reachable nodes have the same version.
     pub async fn verify_consistency(&mut self, table: &str) -> Result<()> {
-        let req = GetVersionRequest { table: table.to_string() };
-        
+        let req = GetVersionRequest {
+            table: table.to_string(),
+        };
+
         let mut all_clients = vec![self.master_client.clone()];
         all_clients.extend(self.slave_clients.iter().cloned());
-        
+
         // Parallel fetch of versions
         let mut futures = Vec::new();
         for mut client in all_clients.clone() {
@@ -433,7 +534,10 @@ impl MultiDbCoordinator {
         let all_match = available_versions.iter().all(|&v| v == max_version);
 
         if all_match {
-            println!("Consistency Check Passed: All reachable nodes at version {}", max_version);
+            println!(
+                "Consistency Check Passed: All reachable nodes at version {}",
+                max_version
+            );
             Ok(())
         } else {
             // ### 修改记录 (2026-02-17)
@@ -487,5 +591,196 @@ impl MultiDbCoordinator {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl MultiDbCoordinator {
+    pub fn new_for_test(config: ClusterConfig) -> Self {
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let master_client = DatabaseServiceClient::new(channel);
+        Self {
+            master_client,
+            slave_clients: Vec::new(),
+            config,
+            committed_history: Vec::new(),
+            pause_before_commit_ms: None,
+            tx_registry: HashMap::new(),
+            tx_order: VecDeque::new(),
+        }
+    }
+
+    pub fn record_committed_tx_for_test(&mut self, sql: &str, args: &[String]) {
+        self.record_committed_tx(sql, args);
+    }
+
+    pub fn committed_history_len(&self) -> usize {
+        self.committed_history.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::sqlite::SqliteEngine;
+    use crate::engine::StorageEngine;
+    use crate::pb::database_service_server::{DatabaseService, DatabaseServiceServer};
+    use crate::pb::{
+        CommitRequest, CommitResponse, Empty, ExecuteRequest, ExecuteResponse, GetVersionRequest,
+        GetVersionResponse, PrepareRequest, PrepareResponse, RollbackRequest, RollbackResponse,
+    };
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status, transport::Server};
+
+    #[tokio::test]
+    async fn committed_history_respects_limit() {
+        let mut cfg = ClusterConfig::new("http://127.0.0.1:50051", vec![], ConsistencyMode::Quorum);
+        cfg.committed_history_limit = 2;
+        let mut coord = MultiDbCoordinator::new_for_test(cfg);
+        coord.record_committed_tx_for_test("A", &[]);
+        coord.record_committed_tx_for_test("B", &[]);
+        coord.record_committed_tx_for_test("C", &[]);
+        assert_eq!(coord.committed_history_len(), 2);
+    }
+
+    #[derive(Clone)]
+    struct TestDbService {
+        engine: Arc<dyn StorageEngine>,
+    }
+
+    #[tonic::async_trait]
+    impl DatabaseService for TestDbService {
+        async fn check_health(&self, _request: Request<Empty>) -> Result<Response<Empty>, Status> {
+            self.engine
+                .check_health()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(Response::new(Empty {}))
+        }
+
+        async fn execute(
+            &self,
+            request: Request<ExecuteRequest>,
+        ) -> Result<Response<ExecuteResponse>, Status> {
+            let req = request.into_inner();
+            let rows = self
+                .engine
+                .execute(&req.sql)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(Response::new(ExecuteResponse {
+                rows_affected: rows as i32,
+            }))
+        }
+
+        async fn prepare(
+            &self,
+            request: Request<PrepareRequest>,
+        ) -> Result<Response<PrepareResponse>, Status> {
+            let req = request.into_inner();
+            self.engine
+                .prepare(&req.tx_id, &req.sql, req.args)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(Response::new(PrepareResponse {}))
+        }
+
+        async fn commit(
+            &self,
+            request: Request<CommitRequest>,
+        ) -> Result<Response<CommitResponse>, Status> {
+            let req = request.into_inner();
+            self.engine
+                .commit(&req.tx_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(Response::new(CommitResponse {}))
+        }
+
+        async fn rollback(
+            &self,
+            request: Request<RollbackRequest>,
+        ) -> Result<Response<RollbackResponse>, Status> {
+            let req = request.into_inner();
+            self.engine
+                .rollback(&req.tx_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(Response::new(RollbackResponse {}))
+        }
+
+        async fn get_version(
+            &self,
+            request: Request<GetVersionRequest>,
+        ) -> Result<Response<GetVersionResponse>, Status> {
+            let req = request.into_inner();
+            let version = self
+                .engine
+                .get_version(&req.table)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(Response::new(GetVersionResponse { version }))
+        }
+    }
+
+    async fn spawn_server(db_path: &str) -> String {
+        let engine = Arc::new(SqliteEngine::new(db_path).unwrap());
+        let service = TestDbService { engine };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = TcpListenerStream::new(listener);
+        tokio::spawn(
+            Server::builder()
+                .add_service(DatabaseServiceServer::new(service))
+                .serve_with_incoming(incoming),
+        );
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn atomic_write_with_same_tx_id_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let master_db = temp.path().join("master.db");
+        let slave1_db = temp.path().join("slave1.db");
+        let slave2_db = temp.path().join("slave2.db");
+
+        let master_addr = spawn_server(master_db.to_str().unwrap()).await;
+        let slave1_addr = spawn_server(slave1_db.to_str().unwrap()).await;
+        let slave2_addr = spawn_server(slave2_db.to_str().unwrap()).await;
+
+        let mut cfg = ClusterConfig::new(
+            &master_addr,
+            vec![slave1_addr.as_str(), slave2_addr.as_str()],
+            ConsistencyMode::Quorum,
+        );
+        cfg.committed_history_limit = 2;
+        let mut coordinator = MultiDbCoordinator::new(cfg, None).await.unwrap();
+        coordinator
+            .execute_schema_migration(
+                "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, balance INTEGER, version INTEGER DEFAULT 1)",
+            )
+            .await
+            .unwrap();
+
+        let tx_id = "tx_fixed_001";
+        coordinator
+            .atomic_write_with_tx_id(
+                tx_id,
+                "INSERT INTO accounts (id, balance, version) VALUES (?1, ?2, ?3)",
+                vec!["user_001".to_string(), "1000".to_string(), "1".to_string()],
+            )
+            .await
+            .unwrap();
+        coordinator
+            .atomic_write_with_tx_id(
+                tx_id,
+                "INSERT INTO accounts (id, balance, version) VALUES (?1, ?2, ?3)",
+                vec!["user_001".to_string(), "1000".to_string(), "1".to_string()],
+            )
+            .await
+            .unwrap();
     }
 }

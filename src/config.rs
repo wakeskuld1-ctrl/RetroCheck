@@ -17,6 +17,7 @@ pub struct ClusterConfig {
     pub master_addr: String,
     pub slave_addrs: Vec<String>,
     pub mode: ConsistencyMode,
+    pub committed_history_limit: usize,
 }
 
 impl ClusterConfig {
@@ -25,6 +26,7 @@ impl ClusterConfig {
             master_addr: master_addr.to_string(),
             slave_addrs: slave_addrs.iter().map(|s| s.to_string()).collect(),
             mode,
+            committed_history_limit: 32,
         }
     }
 }

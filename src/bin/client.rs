@@ -6,10 +6,10 @@ use std::fs;
 use std::path::Path;
 
 /// Distributed Transaction Client
-/// 
+///
 /// This application serves as the entry point for testing and demonstrating
 /// the distributed transaction capabilities of the system.
-/// 
+///
 /// It performs the following steps:
 /// 1. Initializes the client environment.
 /// 2. Configures the cluster topology (Master + Slaves).
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     if !data_dir.exists() {
         fs::create_dir(data_dir)?;
     }
-    
+
     // Cleanup local WAL if it exists from a previous run.
     // Note: This is for the Coordinator's local log, not the storage engines.
     let _ = fs::remove_file("data/coordinator_wal.db");
@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
     println!(">>> Starting Client in {:?} Mode (gRPC) <<<", mode);
 
     // 2. Configure Cluster
-    // We define the static topology here. In a real system, this might come from 
+    // We define the static topology here. In a real system, this might come from
     // a service discovery mechanism (e.g., etcd, Consul).
     // Master: 50051 (SQLite)
     // Slaves: 50052 (SQLite), 50053 (SQLite)
@@ -138,21 +138,26 @@ async fn main() -> Result<()> {
     // Step A: Schema Migration
     // Create the 'accounts' table on all nodes.
     println!("Creating business tables...");
-    coordinator.execute_schema_migration(
-        "CREATE TABLE IF NOT EXISTS accounts (
+    coordinator
+        .execute_schema_migration(
+            "CREATE TABLE IF NOT EXISTS accounts (
             id TEXT PRIMARY KEY,
             balance INTEGER,
             version INTEGER DEFAULT 1
-        )"
-    ).await?;
+        )",
+        )
+        .await?;
 
     // Step B: Atomic Insert Transaction
     // Insert a new user record. This uses 2PC to ensure it exists on at least Quorum nodes.
     println!("Executing Atomic Transaction 1 (Insert)...");
-    match coordinator.atomic_write(
-        "INSERT INTO accounts (id, balance, version) VALUES (?1, ?2, ?3)",
-        vec!["user_001".to_string(), "1000".to_string(), "1".to_string()]
-    ).await {
+    match coordinator
+        .atomic_write(
+            "INSERT INTO accounts (id, balance, version) VALUES (?1, ?2, ?3)",
+            vec!["user_001".to_string(), "1000".to_string(), "1".to_string()],
+        )
+        .await
+    {
         Ok(_) => println!("Transaction 1 COMMITTED."),
         Err(e) => println!("Transaction 1 FAILED: {}", e),
     }
@@ -161,7 +166,7 @@ async fn main() -> Result<()> {
     // Deduct balance and increment version.
     // Version check ensures Optimistic Concurrency Control (OCC).
     println!("Executing Atomic Transaction 2 (Update with Version)...");
-    let current_version = 1; 
+    let current_version = 1;
     match coordinator.atomic_write(
         "UPDATE accounts SET balance = balance - 100, version = version + 1 WHERE id = ?1 AND version = ?2",
         vec!["user_001".to_string(), current_version.to_string()]

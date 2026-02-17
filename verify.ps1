@@ -161,8 +161,9 @@ function Run-ScenarioPrepareCommitKill {
     Reset-DbFiles
     Stop-AllServers
     $procs = Start-Servers
-    $logFile = "client_prepare_commit_kill.log"
-    Remove-Item -Path $logFile -ErrorAction SilentlyContinue
+    $logFileOut = "client_prepare_commit_kill_out.log"
+    $logFileErr = "client_prepare_commit_kill_err.log"
+    Remove-Item -Path $logFileOut,$logFileErr -ErrorAction SilentlyContinue
     Write-Host ">>> Running Client with pause-before-commit ($PauseBeforeCommitMs ms)..." -ForegroundColor Cyan
     $clientArgs = @(
         "run","--bin","client","--",
@@ -172,8 +173,13 @@ function Run-ScenarioPrepareCommitKill {
         "--scenario","full",
         "--pause-before-commit-ms",$PauseBeforeCommitMs
     )
-    $clientProc = Start-Process -FilePath "cargo" -ArgumentList $clientArgs -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError $logFile
-    $pauseHit = Wait-ForClientPauseLog -LogFile $logFile -TimeoutMs ([Math]::Max($PauseBeforeCommitMs, 3000))
+    $clientProc = Start-Process -FilePath "cargo" -ArgumentList $clientArgs -NoNewWindow -PassThru -RedirectStandardOutput $logFileOut -RedirectStandardError $logFileErr
+    if (-not $clientProc) {
+        Write-Error "Client process failed to start."
+        Stop-AllServers
+        exit 1
+    }
+    $pauseHit = Wait-ForClientPauseLog -LogFile $logFileOut -TimeoutMs ([Math]::Max($PauseBeforeCommitMs, 3000))
     if (-not $pauseHit) {
         Write-Host ">>> Pause window log not found, fallback to timed wait..." -ForegroundColor Yellow
         Start-Sleep -Milliseconds ([int]($PauseBeforeCommitMs / 2))
@@ -203,6 +209,153 @@ function Run-ScenarioPrepareCommitKillMatrix {
     }
 }
 
+function Run-ScenarioChaosMultiRestart {
+    Reset-DbFiles
+    Stop-AllServers
+    $procs = Start-Servers
+    Run-ClientFull
+    Write-Host ">>> Restarting Slave 1 (chaos)..." -ForegroundColor Yellow
+    Stop-Process -Id $procs["Slave1"].Id -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $procs["Slave1"] = Start-Process -FilePath "target_new/debug/server.exe" -ArgumentList "--port", "50052", "--db", "slave1.db", "--engine", $Engine -NoNewWindow -PassThru
+    Start-Sleep -Seconds 3
+    Write-Host ">>> Restarting Slave 2 (chaos)..." -ForegroundColor Yellow
+    Stop-Process -Id $procs["Slave2"].Id -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $procs["Slave2"] = Start-Process -FilePath "target_new/debug/server.exe" -ArgumentList "--port", "50053", "--db", "slave2.db", "--engine", $Engine -NoNewWindow -PassThru
+    Start-Sleep -Seconds 3
+    for ($i = 1; $i -le $VerifyRepeatCount; $i++) {
+        Write-Host ">>> Repeat verify-only ($i/$VerifyRepeatCount)..." -ForegroundColor Cyan
+        Run-ClientVerifyOnly
+    }
+    Stop-AllServers
+}
+
+function Run-ScenarioChaosMixedFaults {
+    Reset-DbFiles
+    Stop-AllServers
+    $procs = Start-Servers
+    $logFileOut = "client_chaos_mixed_faults_out.log"
+    $logFileErr = "client_chaos_mixed_faults_err.log"
+    Remove-Item -Path $logFileOut,$logFileErr -ErrorAction SilentlyContinue
+    Write-Host ">>> Running Client with pause-before-commit ($PauseBeforeCommitMs ms)..." -ForegroundColor Cyan
+    $clientArgs = @(
+        "run","--bin","client","--",
+        "--master-addr",$MasterAddr,
+        "--slave-addrs",$SlaveAddrs,
+        "--mode",$Mode,
+        "--scenario","full",
+        "--pause-before-commit-ms",$PauseBeforeCommitMs
+    )
+    $clientProc = Start-Process -FilePath "cargo" -ArgumentList $clientArgs -NoNewWindow -PassThru -RedirectStandardOutput $logFileOut -RedirectStandardError $logFileErr
+    if (-not $clientProc) {
+        Write-Error "Client process failed to start."
+        Stop-AllServers
+        exit 1
+    }
+    $pauseHit = Wait-ForClientPauseLog -LogFile $logFileOut -TimeoutMs ([Math]::Max($PauseBeforeCommitMs, 3000))
+    if (-not $pauseHit) {
+        Write-Host ">>> Pause window log not found, fallback to timed wait..." -ForegroundColor Yellow
+        Start-Sleep -Milliseconds ([int]($PauseBeforeCommitMs / 2))
+    }
+    Write-Host ">>> Killing Slave 2 during pause window (chaos)..." -ForegroundColor Yellow
+    Stop-Process -Id $procs["Slave2"].Id -ErrorAction SilentlyContinue
+    Wait-Process -Id $clientProc.Id
+    Write-Host ">>> Restarting Slave 2 (chaos)..." -ForegroundColor Yellow
+    $procs["Slave2"] = Start-Process -FilePath "target_new/debug/server.exe" -ArgumentList "--port", "50053", "--db", "slave2.db", "--engine", $Engine -NoNewWindow -PassThru
+    Start-Sleep -Seconds 3
+    Write-Host ">>> Killing Slave 1 after commit (chaos)..." -ForegroundColor Yellow
+    Stop-Process -Id $procs["Slave1"].Id -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Write-Host ">>> Restarting Slave 1 (chaos)..." -ForegroundColor Yellow
+    $procs["Slave1"] = Start-Process -FilePath "target_new/debug/server.exe" -ArgumentList "--port", "50052", "--db", "slave1.db", "--engine", $Engine -NoNewWindow -PassThru
+    Start-Sleep -Seconds 3
+    for ($i = 1; $i -le $VerifyRepeatCount; $i++) {
+        Write-Host ">>> Repeat verify-only ($i/$VerifyRepeatCount)..." -ForegroundColor Cyan
+        Run-ClientVerifyOnly
+    }
+    Stop-AllServers
+}
+
+function Run-ScenarioChaosPrepareCommitAlternate {
+    # ### Change Log (2026-02-18)
+    # - Reason: add alternating prepare/commit kill scenario
+    # - Goal: validate replay consistency under alternating slave failures
+    Reset-DbFiles
+    for ($round = 1; $round -le $VerifyRepeatCount; $round++) {
+        # ### Change Log (2026-02-18)
+        # - Reason: ensure clean process handles per round
+        # - Goal: isolate each alternating failure cycle
+        Stop-AllServers
+        $procs = Start-Servers
+        # ### Change Log (2026-02-18)
+        # - Reason: PowerShell 不允许 stdout/stderr 指向同一文件
+        # - Goal: 分离日志文件避免 Start-Process 失败
+        $logFileOut = "client_prepare_commit_alternate_${round}_out.log"
+        $logFileErr = "client_prepare_commit_alternate_${round}_err.log"
+        Remove-Item -Path $logFileOut,$logFileErr -ErrorAction SilentlyContinue
+        # ### Change Log (2026-02-18)
+        # - Reason: PowerShell 变量拼接导致解析错误
+        # - Goal: 使用 ${} 明确变量边界
+        Write-Host ">>> Round ${round}/${VerifyRepeatCount}: Running Client with pause-before-commit ($PauseBeforeCommitMs ms)..." -ForegroundColor Cyan
+        $clientArgs = @(
+            "run","--bin","client","--",
+            "--master-addr",$MasterAddr,
+            "--slave-addrs",$SlaveAddrs,
+            "--mode",$Mode,
+            "--scenario","full",
+            "--pause-before-commit-ms",$PauseBeforeCommitMs
+        )
+        $clientProc = Start-Process -FilePath "cargo" -ArgumentList $clientArgs -NoNewWindow -PassThru -RedirectStandardOutput $logFileOut -RedirectStandardError $logFileErr
+        # ### Change Log (2026-02-18)
+        # - Reason: Start-Process 失败会返回空对象
+        # - Goal: 及时中止以避免后续空引用
+        if (-not $clientProc) {
+            Write-Error "Client process failed to start."
+            Stop-AllServers
+            exit 1
+        }
+        $pauseHit = Wait-ForClientPauseLog -LogFile $logFileOut -TimeoutMs ([Math]::Max($PauseBeforeCommitMs, 3000))
+        if (-not $pauseHit) {
+            Write-Host ">>> Pause window log not found, fallback to timed wait..." -ForegroundColor Yellow
+            Start-Sleep -Milliseconds ([int]($PauseBeforeCommitMs / 2))
+        }
+        if ($round % 2 -eq 1) {
+            # ### Change Log (2026-02-18)
+            # - Reason: alternate kill target each round
+            # - Goal: validate both slaves can recover via replay
+            Write-Host ">>> Killing Slave 1 during pause window (alternate)..." -ForegroundColor Yellow
+            Stop-Process -Id $procs["Slave1"].Id -ErrorAction SilentlyContinue
+        } else {
+            # ### Change Log (2026-02-18)
+            # - Reason: alternate kill target each round
+            # - Goal: validate both slaves can recover via replay
+            Write-Host ">>> Killing Slave 2 during pause window (alternate)..." -ForegroundColor Yellow
+            Stop-Process -Id $procs["Slave2"].Id -ErrorAction SilentlyContinue
+        }
+        Wait-Process -Id $clientProc.Id
+        if ($round % 2 -eq 1) {
+            # ### Change Log (2026-02-18)
+            # - Reason: restart killed slave for replay
+            # - Goal: allow verify-only to observe recovery
+            Write-Host ">>> Restarting Slave 1 (alternate)..." -ForegroundColor Yellow
+            $procs["Slave1"] = Start-Process -FilePath "target_new/debug/server.exe" -ArgumentList "--port", "50052", "--db", "slave1.db", "--engine", $Engine -NoNewWindow -PassThru
+        } else {
+            # ### Change Log (2026-02-18)
+            # - Reason: restart killed slave for replay
+            # - Goal: allow verify-only to observe recovery
+            Write-Host ">>> Restarting Slave 2 (alternate)..." -ForegroundColor Yellow
+            $procs["Slave2"] = Start-Process -FilePath "target_new/debug/server.exe" -ArgumentList "--port", "50053", "--db", "slave2.db", "--engine", $Engine -NoNewWindow -PassThru
+        }
+        Start-Sleep -Seconds 3
+        # ### Change Log (2026-02-18)
+        # - Reason: re-check consistency after restart
+        # - Goal: detect replay gaps early
+        Run-ClientVerifyOnly
+    }
+    Stop-AllServers
+}
+
 function Run-ScenarioRepeatVerify3x {
     Reset-DbFiles
     Stop-AllServers
@@ -227,7 +380,11 @@ switch ($Scenario) {
     "restart_single_node" { Run-ScenarioRestartSingleNode }
     "prepare_commit_kill" { Run-ScenarioPrepareCommitKill }
     "prepare_commit_kill_matrix" { Run-ScenarioPrepareCommitKillMatrix }
+    "chaos_prepare_commit_kill_matrix" { Run-ScenarioPrepareCommitKillMatrix }
+    "chaos_prepare_commit_alternate" { Run-ScenarioChaosPrepareCommitAlternate }
     "repeat_verify_3x" { Run-ScenarioRepeatVerify3x }
+    "chaos_multi_restart" { Run-ScenarioChaosMultiRestart }
+    "chaos_mixed_faults" { Run-ScenarioChaosMixedFaults }
     default {
         Write-Host "Unknown scenario '$Scenario', fallback to full." -ForegroundColor Yellow
         Run-ScenarioFull
