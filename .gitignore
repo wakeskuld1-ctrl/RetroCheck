@@ -1,2 +1,27 @@
-/target
-/.worktrees
+# Rust build artifacts
+/target/
+/target_new/
+/target_old/
+Cargo.lock
+
+# SQLite databases (runtime data)
+*.db
+*.db.shm
+*.db.wal
+*.db-shm
+*.db-wal
+/data/
+
+# Worktrees
+.worktrees/
+
+# IDE & Editor
+.trae/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

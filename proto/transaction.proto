@@ -1,0 +1,32 @@
+syntax = "proto3";
+package transaction;
+
+service DatabaseService {
+  rpc Execute (ExecuteRequest) returns (ExecuteResponse);
+  rpc Prepare (PrepareRequest) returns (PrepareResponse);
+  rpc Commit (CommitRequest) returns (CommitResponse);
+  rpc Rollback (RollbackRequest) returns (RollbackResponse);
+  rpc GetVersion (GetVersionRequest) returns (GetVersionResponse);
+  rpc CheckHealth (Empty) returns (Empty);
+}
+
+message ExecuteRequest { string sql = 1; }
+message ExecuteResponse { int32 rows_affected = 1; }
+
+message PrepareRequest {
+  string tx_id = 1;
+  string sql = 2;
+  repeated string args = 3;
+}
+message PrepareResponse {}
+
+message CommitRequest { string tx_id = 1; }
+message CommitResponse {}
+
+message RollbackRequest { string tx_id = 1; }
+message RollbackResponse {}
+
+message GetVersionRequest { string table = 1; }
+message GetVersionResponse { int32 version = 1; }
+
+message Empty {}
