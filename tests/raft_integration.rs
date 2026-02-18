@@ -36,9 +36,9 @@ async fn three_nodes_write_and_failover() {
     let v2 = router2.get_version("accounts".to_string()).await.unwrap();
     let v3 = router3.get_version("accounts".to_string()).await.unwrap();
 
-    assert_eq!(v1, 1);
-    assert_eq!(v2, 1);
-    assert_eq!(v3, 1);
+    assert_eq!(v1, 2);
+    assert_eq!(v2, 2);
+    assert_eq!(v3, 2);
 
     drop(router1);
     let router1_restart =
@@ -48,5 +48,5 @@ async fn three_nodes_write_and_failover() {
         .get_version("accounts".to_string())
         .await
         .unwrap();
-    assert_eq!(v1_restart, 1);
+    assert_eq!(v1_restart, 2);
 }

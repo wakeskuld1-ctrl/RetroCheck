@@ -99,7 +99,7 @@ sequenceDiagram
 ```
 
 ## 7. Required Notes
-- **Schema constraint**: Business tables must include a `version` column.
+- **Consistency basis**: Uses an internal write sequence; business tables do not need a `version` column.
 - **Ports and files**: Ensure ports are available; SQLite files are created on demand.
 - **Fault injection**: Use `--pause-before-commit-ms` to open the failure window.
 - **Leader dependency**: Writes fail without an elected leader.

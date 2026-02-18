@@ -24,16 +24,16 @@ async fn read_get_version_uses_state_machine() {
     .unwrap();
 
     let _ = router
-        .write("CREATE TABLE IF NOT EXISTS accounts (id TEXT, version INTEGER)".to_string())
+        .write("CREATE TABLE IF NOT EXISTS accounts (id TEXT, balance INTEGER)".to_string())
         .await
         .unwrap();
     let _ = router
-        .write("INSERT INTO accounts (id, version) VALUES ('u1', 1)".to_string())
+        .write("INSERT INTO accounts (id, balance) VALUES ('u1', 100)".to_string())
         .await
         .unwrap();
 
     let version = router.get_version("accounts".to_string()).await.unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 /// ### 修改记录 (2026-02-17)

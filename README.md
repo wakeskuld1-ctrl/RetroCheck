@@ -169,8 +169,13 @@ cargo run --bin client -- --master-addr http://127.0.0.1:50051 --slave-addrs htt
    **Expected Output / 输出预期**: Each verify-only run reports consistent versions.
 
 ## Required Notes
-- **Schema constraint**: business tables must include a `version` column.
+- **Consistency basis**: uses an internal write sequence; business tables do not need a `version` column.
 - **Ports**: ensure 50051/50052/50053 (or custom) are available.
 - **Data files**: SQLite files are created on demand; clean them between test runs if needed.
 - **Pause window**: use `--pause-before-commit-ms` for fault-injection scenarios.
 - **Leader availability**: writes fail when no Raft leader is elected.
+
+## Next Steps
+- When 2PC supports multi-statement transactions, increment the sequence by statement count and add tests.
+- Ensure ExecuteBatch does not increment the sequence on rollback, with success/failure tests.
+- Keep non-leader get_version returning 0 without error and add coverage.

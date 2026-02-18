@@ -299,6 +299,7 @@ impl DbActor {
                          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         [],
                     );
+                    let _ = self.bump_write_seq(1);
                 }
                 let _ = resp.send(res.map_err(|e| anyhow!(e)));
             }
@@ -335,6 +336,7 @@ impl DbActor {
                          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         [],
                     );
+                    let _ = self.bump_write_seq(sqls.len() as i32);
                     let _ = resp.send(Ok(rows));
                 }
             }
@@ -391,6 +393,12 @@ impl DbActor {
                     if self.active_tx.as_ref() != Some(&tx_id) {
                         return Err(anyhow!("No matching active transaction"));
                     }
+                    self.conn.execute(
+                        "INSERT INTO _raft_meta(key, value) VALUES ('last_write_at', strftime('%s','now'))
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        [],
+                    )?;
+                    self.bump_write_seq(1)?;
                     self.conn.execute("COMMIT", [])?;
                     self.active_tx = None;
                     Ok(())
@@ -419,10 +427,11 @@ impl DbActor {
                 let _ = resp.send(res);
             }
             DbMessage::GetMaxVersion { table, resp } => {
+                let _ = table;
                 let res = (|| -> Result<i32> {
-                    let mut stmt = self
-                        .conn
-                        .prepare(&format!("SELECT MAX(version) FROM {}", table))?;
+                    let mut stmt = self.conn.prepare(
+                        "SELECT CAST(value AS INTEGER) FROM _raft_meta WHERE key='last_write_seq'",
+                    )?;
                     let version: Option<i32> = stmt.query_row([], |row| row.get(0)).unwrap_or(None);
                     Ok(version.unwrap_or(0))
                 })();
@@ -489,8 +498,17 @@ impl DbActor {
             "INSERT OR IGNORE INTO _raft_meta(key, value) VALUES
              ('last_write_at', '0'),
              ('last_snapshot_at', '0'),
-             ('last_snapshot_index', '0')",
+             ('last_snapshot_index', '0'),
+             ('last_write_seq', '0')",
             [],
+        )?;
+        Ok(())
+    }
+
+    fn bump_write_seq(&mut self, delta: i32) -> Result<()> {
+        self.conn.execute(
+            "UPDATE _raft_meta SET value = CAST(value AS INTEGER) + ?1 WHERE key='last_write_seq'",
+            rusqlite::params![delta],
         )?;
         Ok(())
     }
