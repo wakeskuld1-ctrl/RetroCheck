@@ -12,7 +12,7 @@ futures = "0.3.32"
 ## ### 修改记录 (2026-02-17)
 ## - 原因: 需要 Raft 共识与序列化支持
 ## - 目的: 引入 OpenRaft 与 bincode 以承载日志复制
-openraft = "0.9"
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 bincode = "1.3"
 prost = "0.14.3"
 rusqlite = { version = "0.38.0", features = ["bundled"] }

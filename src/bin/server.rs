@@ -272,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ### 修改记录 (2026-02-17)
             // - 原因: 需要引入 RaftNode 写路径
             // - 目的: 让 Router 写入走 RaftNode
-            let raft_node = RaftNode::start_local(1, args.db.clone()).await?;
+            let raft_node = RaftNode::start_local(1, std::path::PathBuf::from(args.db.clone())).await?;
             let router = Router::new_with_raft(raft_node);
             Arc::new(RouterEngine::new(router))
         }

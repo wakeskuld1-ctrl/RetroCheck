@@ -2,83 +2,175 @@
 //! - 原因: 需要最小网络适配用于测试
 //! - 目的: 先验证复制路径，再逐步替换为 OpenRaft 网络层
 
-use anyhow::{Result, anyhow};
+use crate::raft::types::{NodeId, TypeConfig};
+use anyhow::Result;
+use async_trait::async_trait;
+use openraft::error::{Fatal, InstallSnapshotError, RPCError, RaftError, RemoteError};
+use openraft::network::RPCOption;
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
+use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::raft::raft_node::RaftNode;
-
-/// ### 修改记录 (2026-02-17)
-/// - 原因: 需要测试环境的节点注册表
-/// - 目的: 模拟网络传输时的节点寻址
-#[derive(Clone)]
-pub struct TestNetwork {
-    /// ### 修改记录 (2026-02-17)
-    /// - 原因: 需要共享节点映射
-    /// - 目的: 让多测试线程访问同一份注册表
-    nodes: Arc<Mutex<HashMap<u64, RaftNode>>>,
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 解耦 Raft 实例与网络层
+/// - 目的: 避免循环依赖，支持多种实现
+#[async_trait]
+pub trait RaftNetworkTarget: Send + Sync {
+    async fn append_entries(
+        &self,
+        req: AppendEntriesRequest<TypeConfig>,
+    ) -> Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>;
+    async fn install_snapshot(
+        &self,
+        req: InstallSnapshotRequest<TypeConfig>,
+    ) -> Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>;
+    async fn vote(
+        &self,
+        req: VoteRequest<NodeId>,
+    ) -> Result<VoteResponse<NodeId>, RaftError<NodeId>>;
 }
 
-impl TestNetwork {
-    /// ### 修改记录 (2026-02-17)
-    /// - 原因: 需要初始化空网络
-    /// - 目的: 为测试提供独立上下文
+
+
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要一个内存中的路由器
+/// - 目的: 模拟网络传输，查找目标节点
+#[derive(Clone)]
+pub struct RaftRouter {
+    targets: Arc<Mutex<HashMap<NodeId, Arc<dyn RaftNetworkTarget>>>>,
+}
+
+impl RaftRouter {
     pub fn new() -> Self {
         Self {
-            nodes: Arc::new(Mutex::new(HashMap::new())),
+            targets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// ### 修改记录 (2026-02-17)
-    /// - 原因: 需要注册节点以便查找
-    /// - 目的: 模拟网络中的节点发现
-    pub fn register_node(&self, node: RaftNode) {
-        // ### 修改记录 (2026-02-17)
-        // - 原因: 需要写入共享映射
-        // - 目的: 允许后续复制调用定位目标
-        let mut guard = self.nodes.lock().unwrap();
-        guard.insert(node.node_id(), node);
+    pub fn register(&self, node_id: NodeId, target: Arc<dyn RaftNetworkTarget>) {
+        let mut targets = self.targets.lock().unwrap();
+        targets.insert(node_id, target);
     }
 
-    /// ### 修改记录 (2026-02-17)
-    /// - 原因: 需要在测试中读取节点
-    /// - 目的: 验证复制结果
-    pub fn get_node_for_test(&self, node_id: u64) -> Option<RaftNode> {
-        // ### 修改记录 (2026-02-17)
-        // - 原因: 需要从共享表中获取节点
-        // - 目的: 提供只读访问能力
-        let guard = self.nodes.lock().unwrap();
-        guard.get(&node_id).cloned()
-    }
-
-    /// ### 修改记录 (2026-02-17)
-    /// - 原因: 需要最小复制路径
-    /// - 目的: 驱动 follower 应用写入
-    pub async fn replicate_sql_for_test(&self, target_id: u64, sql: String) -> Result<usize> {
-        // ### 修改记录 (2026-02-17)
-        // - 原因: 需要查询目标节点
-        // - 目的: 作为网络寻址的最小实现
-        let node = {
-            let guard = self.nodes.lock().unwrap();
-            guard.get(&target_id).cloned()
+    pub async fn send_append_entries(
+        &self,
+        target: NodeId,
+        req: AppendEntriesRequest<TypeConfig>,
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>> {
+        let target_node = {
+            let targets = self.targets.lock().unwrap();
+            targets.get(&target).cloned()
         };
-        let node = node.ok_or_else(|| anyhow!("Target node not found"))?;
 
-        // ### 修改记录 (2026-02-17)
-        // - 原因: 需要执行写入应用
-        // - 目的: 模拟复制后的日志应用
-        node.apply_sql_for_test(sql).await
+        if let Some(t) = target_node {
+            t.append_entries(req).await.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+        } else {
+             Err(RPCError::RemoteError(RemoteError::new(target, RaftError::Fatal(Fatal::Panicked))))
+        }
+    }
+
+    pub async fn send_install_snapshot(
+        &self,
+        target: NodeId,
+        req: InstallSnapshotRequest<TypeConfig>,
+    ) -> Result<
+        InstallSnapshotResponse<NodeId>,
+        RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId, InstallSnapshotError>>,
+    > {
+        let target_node = {
+            let targets = self.targets.lock().unwrap();
+            targets.get(&target).cloned()
+        };
+
+        if let Some(t) = target_node {
+            t.install_snapshot(req).await.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+        } else {
+            Err(RPCError::RemoteError(RemoteError::new(target, RaftError::Fatal(Fatal::Panicked))))
+        }
+    }
+
+    pub async fn send_vote(
+        &self,
+        target: NodeId,
+        req: VoteRequest<NodeId>,
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>> {
+        let target_node = {
+            let targets = self.targets.lock().unwrap();
+            targets.get(&target).cloned()
+        };
+
+        if let Some(t) = target_node {
+            t.vote(req).await.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+        } else {
+            Err(RPCError::RemoteError(RemoteError::new(target, RaftError::Fatal(Fatal::Panicked))))
+        }
     }
 }
 
-// ### 修改记录 (2026-02-26)
-// - 原因: 需要满足 clippy new_without_default
-// - 目的: 提供默认构造入口
-impl Default for TestNetwork {
+impl Default for RaftRouter {
     fn default() -> Self {
-        // ### 修改记录 (2026-02-26)
-        // - 原因: 需要复用 new
-        // - 目的: 保持构造行为一致
         Self::new()
     }
 }
+
+pub struct NetworkConnection {
+    target: NodeId,
+    router: RaftRouter,
+}
+
+//
+impl RaftNetwork<TypeConfig> for NetworkConnection {
+    async fn append_entries(
+        &mut self,
+        req: AppendEntriesRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        self.router.send_append_entries(self.target, req).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        req: InstallSnapshotRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<
+        InstallSnapshotResponse<NodeId>,
+        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+    > {
+        self.router.send_install_snapshot(self.target, req).await
+    }
+
+    async fn vote(
+        &mut self,
+        req: VoteRequest<NodeId>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        self.router.send_vote(self.target, req).await
+    }
+}
+
+#[derive(Clone)]
+pub struct RaftNetworkFactoryImpl {
+    router: RaftRouter,
+}
+
+impl RaftNetworkFactoryImpl {
+    pub fn new(router: RaftRouter) -> Self {
+        Self { router }
+    }
+}
+
+impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
+    type Network = NetworkConnection;
+
+    async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
+        NetworkConnection {
+            target,
+            router: self.router.clone(),
+        }
+    }
+}
+

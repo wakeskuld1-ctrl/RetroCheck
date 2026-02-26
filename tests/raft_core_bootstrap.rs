@@ -16,7 +16,25 @@ async fn raft_node_bootstrap_and_becomes_leader() {
     let base_dir = std::env::temp_dir().join("raft_core_bootstrap");
 
     // ### 修改记录 (2026-02-17)
-    // - 原因: RaftNode 尚未实现
-    // - 目的: 通过编译失败驱动实现
-    let _node = RaftNode::start_for_test(node_id, base_dir).await.unwrap();
+    // - 原因: 需要验证节点能自举
+    // - 目的: 通过测试驱动实现
+    let node = RaftNode::start_local(node_id, base_dir).await.unwrap();
+
+    // ### 修改记录 (2026-02-17)
+    // - 原因: 单节点需要显式初始化才能成为 Leader
+    // - 目的: 触发 election 并成为 Leader
+    let mut members = std::collections::BTreeSet::new();
+    members.insert(node_id);
+    node.raft.initialize(members).await.unwrap();
+
+    // Wait for leader state
+    let mut metrics = node.raft.metrics().borrow().clone();
+    loop {
+        if metrics.state == openraft::ServerState::Leader {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        metrics = node.raft.metrics().borrow().clone();
+    }
 }
+

@@ -4,6 +4,29 @@
 
 use serde::{Deserialize, Serialize};
 
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要统一节点标识类型
+/// - 目的: 让 RaftTypeConfig 可被全局复用
+pub type NodeId = u64;
+
+// ### 修改记录 (2026-02-26)
+// - 原因: 需要显式声明 OpenRaft 类型配置
+// - 目的: 自动补齐 Responder 与 Trait 约束
+openraft::declare_raft_types!(
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要绑定 Raft 类型配置
+    /// - 目的: 统一 Request/Response 与运行时定义
+    pub TypeConfig:
+        D = Request,
+        R = Response,
+        NodeId = NodeId,
+        Node = openraft::BasicNode,
+        Entry = openraft::Entry<TypeConfig>,
+        SnapshotData = std::io::Cursor<Vec<u8>>,
+        Responder = openraft::impls::OneshotResponder<TypeConfig>,
+        AsyncRuntime = openraft::TokioRuntime,
+);
+
 /// ### 修改记录 (2026-02-17)
 /// - 原因: Raft 复制需要结构化请求
 /// - 目的: 统一读写命令的封装

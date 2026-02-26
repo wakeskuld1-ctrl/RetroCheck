@@ -55,3 +55,50 @@ fn raft_store_persists_snapshot_index() {
         assert_eq!(store.get_last_snapshot_index().unwrap(), 7);
     }
 }
+
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要验证日志追加与读取能力
+/// - 目的: 为 RaftLogStorage 的最小实现提供保证
+#[tokio::test]
+async fn raft_store_appends_and_reads_logs() {
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 测试需要隔离的临时目录
+    // - 目的: 避免污染真实数据目录
+    let dir = tempfile::tempdir().unwrap();
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要初始化 RaftStore
+    // - 目的: 验证日志追加与读取闭环
+    let mut store = check_program::raft::store::RaftStore::open(dir.path()).unwrap();
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要构造最小日志条目
+    // - 目的: 验证 append 的读写路径
+    let entry = openraft::Entry::<check_program::raft::types::TypeConfig>::new(
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要构造基础 log_id
+        // - 目的: 让存储层具备索引信息
+        openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要最小载荷
+        // - 目的: 保证 append 可执行
+        openraft::EntryPayload::Blank,
+    );
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要写入日志并触发回调
+    // - 目的: 验证存储具备 append 能力
+    store
+        .append(vec![entry.clone()], openraft::storage::LogFlushed::noop())
+        .await
+        .unwrap();
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要获取只读日志视图
+    // - 目的: 验证读取路径完整
+    let mut reader = store.get_log_reader().await;
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要读取指定范围日志
+    // - 目的: 确认 append 结果可见
+    let entries = reader.try_get_log_entries(1..2).await.unwrap();
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要断言数量
+    // - 目的: 保证日志读取正确
+    assert_eq!(entries.len(), 1);
+}
