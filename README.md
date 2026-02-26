@@ -100,13 +100,13 @@ sequenceDiagram
 ## Cloud-Edge-End AIoT Architecture (Embedded Data Foundation)
 ```mermaid
 flowchart TB
-    subgraph Cloud [Cloud Layer]
+    subgraph Cloud ["Cloud Layer"]
         direction TB
         ModelTrain[Model Training/Fine-tuning]
         GlobalPolicy[Global Policy Dispatch]
     end
 
-    subgraph Hub [Hub Layer - AI Decision Core]
+    subgraph Hub ["Hub Layer - AI Decision Core"]
         direction TB
         TinyLLM[Tiny LLM / Decision Engine]
         RaftCluster[Raft Consensus (SQLite)]
@@ -116,14 +116,14 @@ flowchart TB
         TinyLLM --> DecisionMaker
     end
 
-    subgraph Edge [Edge Layer - Execution & Sensing]
+    subgraph Edge ["Edge Layer - Execution & Sensing"]
         direction TB
         EdgeStore[A/B Storage (Sled)]
         ExecUnit[Instruction Execution]
         DataBuffer[Data Buffer]
     end
 
-    subgraph Devices [Device Layer]
+    subgraph Devices ["Device Layer"]
         Sensor[Sensors]
         Actuator[Actuators]
     end
