@@ -321,11 +321,14 @@ impl MultiDbCoordinator {
     fn trim_tx_registry(&mut self) {
         while self.tx_order.len() > TX_REGISTRY_LIMIT {
             if let Some(tx_id) = self.tx_order.pop_front() {
-                if let Some(state) = self.tx_registry.get(&tx_id) {
-                    if *state == TxState::InProgress {
-                        self.tx_order.push_back(tx_id);
-                        break;
-                    }
+                // ### 修改记录 (2026-02-26)
+                // - 原因: 需要满足 clippy collapsible_if
+                // - 目的: 简化条件分支并保持原语义
+                if let Some(state) = self.tx_registry.get(&tx_id)
+                    && *state == TxState::InProgress
+                {
+                    self.tx_order.push_back(tx_id);
+                    break;
                 }
                 self.tx_registry.remove(&tx_id);
             }
@@ -409,7 +412,7 @@ impl MultiDbCoordinator {
             let mut rollback_futures = Vec::new();
             for i in prepared_indices {
                 let mut client = all_clients[i].clone();
-            let tid = tx_id.to_string();
+                let tid = tx_id.to_string();
                 rollback_futures
                     .push(async move { client.rollback(RollbackRequest { tx_id: tid }).await });
             }
@@ -622,8 +625,8 @@ impl MultiDbCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::sqlite::SqliteEngine;
     use crate::engine::StorageEngine;
+    use crate::engine::sqlite::SqliteEngine;
     use crate::pb::database_service_server::{DatabaseService, DatabaseServiceServer};
     use crate::pb::{
         CommitRequest, CommitResponse, Empty, ExecuteRequest, ExecuteResponse, GetVersionRequest,

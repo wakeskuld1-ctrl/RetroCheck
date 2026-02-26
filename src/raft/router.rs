@@ -2,6 +2,8 @@
 //! - 原因: 需要提供最小 Router 入口
 //! - 目的: 支持 Leader 判断与转发路径
 
+use crate::pb::ExecuteRequest;
+use crate::pb::database_service_client::DatabaseServiceClient;
 use crate::raft::raft_node::RaftNode;
 use crate::raft::state_machine::SqliteStateMachine;
 use anyhow::{Result, anyhow};
@@ -152,6 +154,14 @@ pub struct Router {
     /// - 原因: 需要接入 Raft 写路径
     /// - 目的: 统一 Router 写入到 RaftNode
     raft_node: Option<RaftNode>,
+    /// ### 修改记录 (2026-02-25)
+    /// - 原因: 非 Leader 需要转发到 Leader
+    /// - 目的: 保存 Leader 地址以便执行 gRPC 转发
+    leader_addr: Option<String>,
+    /// ### 修改记录 (2026-02-25)
+    /// - 原因: 转发需要超时保护
+    /// - 目的: 避免转发请求无限等待
+    forward_timeout_ms: Option<u64>,
     batcher: Option<BatchWriter>,
     batch_max_wait_ms: Option<u64>,
 }
@@ -165,6 +175,8 @@ impl Router {
             is_leader,
             state_machine: None,
             raft_node: None,
+            leader_addr: None,
+            forward_timeout_ms: None,
             batcher: None,
             batch_max_wait_ms: None,
         }
@@ -176,6 +188,9 @@ impl Router {
     /// ### 修改记录 (2026-02-17)
     /// - 原因: 需要返回 rows_affected
     /// - 目的: 保持 SQLite 风格的返回值
+    /// ### 修改记录 (2026-02-25)
+    /// - 原因: 非 Leader 需要转发到 Leader
+    /// - 目的: 统一由 Router 承担转发职责
     pub async fn write(&self, sql: String) -> Result<usize> {
         if self.is_leader {
             if let Some(raft_node) = &self.raft_node {
@@ -192,7 +207,42 @@ impl Router {
                 Ok(0)
             }
         } else {
-            Err(anyhow!("Not leader"))
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 非 Leader 写入需要转发
+            // - 目的: 让客户端保持相同写语义
+            if let Some(leader_addr) = &self.leader_addr {
+                // ### 修改记录 (2026-02-25)
+                // - 原因: 需要动态连接 Leader
+                // - 目的: 避免长连接管理复杂度
+                let mut client = DatabaseServiceClient::connect(leader_addr.clone())
+                    .await
+                    .map_err(|e| anyhow!("Leader connect failed: {}", e))?;
+                // ### 修改记录 (2026-02-25)
+                // - 原因: 需要透传 SQL 写请求
+                // - 目的: 保持与对外 Execute 接口一致
+                let req = ExecuteRequest { sql };
+                // ### 修改记录 (2026-02-25)
+                // - 原因: 需要控制转发等待时间
+                // - 目的: 防止转发阻塞调用方
+                let timeout_ms = self.forward_timeout_ms.unwrap_or(2000);
+                let res =
+                    tokio::time::timeout(Duration::from_millis(timeout_ms), client.execute(req))
+                        .await
+                        .map_err(|_| anyhow!("Leader forward timeout"))?;
+                // ### 修改记录 (2026-02-25)
+                // - 原因: 需要将 gRPC 结果映射为 Router 结果
+                // - 目的: 统一错误风格与返回值
+                // ### 修改记录 (2026-02-25)
+                // - 原因: 错误信息可能包含敏感内容
+                // - 目的: 执行错误统一脱敏处理
+                let resp = res.map_err(|_| anyhow!("Leader execute failed"))?;
+                Ok(resp.into_inner().rows_affected as usize)
+            } else {
+                // ### 修改记录 (2026-02-25)
+                // - 原因: 缺少 Leader 地址无法转发
+                // - 目的: 返回明确错误便于上层处理
+                Err(anyhow!("Not leader and leader address unknown"))
+            }
         }
     }
 
@@ -220,6 +270,8 @@ impl Router {
             is_leader: true,
             state_machine: Some(state_machine),
             raft_node: None,
+            leader_addr: None,
+            forward_timeout_ms: None,
             batcher: None,
             batch_max_wait_ms: None,
         })
@@ -232,6 +284,8 @@ impl Router {
             is_leader: true,
             state_machine: Some(state_machine),
             raft_node: None,
+            leader_addr: None,
+            forward_timeout_ms: None,
             batcher: Some(batcher),
             batch_max_wait_ms: Some(config.max_wait_ms),
         })
@@ -245,7 +299,55 @@ impl Router {
             is_leader: true,
             state_machine: None,
             raft_node: Some(raft_node),
+            leader_addr: None,
+            forward_timeout_ms: None,
             batcher: None,
+            batch_max_wait_ms: None,
+        }
+    }
+
+    /// ### 修改记录 (2026-02-25)
+    /// - 原因: 需要明确构造非 Leader Router
+    /// - 目的: 支持转发到指定 Leader 地址
+    pub fn new_follower_with_leader_addr(leader_addr: String) -> Self {
+        // ### 修改记录 (2026-02-25)
+        // - 原因: 需要默认超时参数
+        // - 目的: 保持旧构造函数行为不变
+        Self::new_follower_with_leader_addr_and_timeout(leader_addr, 2000)
+    }
+
+    /// ### 修改记录 (2026-02-25)
+    /// - 原因: 需要可配置转发超时
+    /// - 目的: 让测试可稳定触发超时路径
+    pub fn new_follower_with_leader_addr_and_timeout(leader_addr: String, timeout_ms: u64) -> Self {
+        Self {
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 非 Leader 构造需要固定角色
+            // - 目的: 确保进入转发逻辑
+            is_leader: false,
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 非 Leader 不持有状态机
+            // - 目的: 避免误走本地写路径
+            state_machine: None,
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 非 Leader 不持有 RaftNode
+            // - 目的: 防止绕过转发
+            raft_node: None,
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 转发需要 Leader 地址
+            // - 目的: 作为 gRPC 目标
+            leader_addr: Some(leader_addr),
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 需要精确控制超时
+            // - 目的: 让超时测试可控
+            forward_timeout_ms: Some(timeout_ms),
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 非 Leader 不使用批处理
+            // - 目的: 保持行为简单
+            batcher: None,
+            // ### 修改记录 (2026-02-25)
+            // - 原因: 非 Leader 不使用批处理
+            // - 目的: 避免无效配置
             batch_max_wait_ms: None,
         }
     }

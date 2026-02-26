@@ -102,8 +102,10 @@ async fn meta_update_interface_writes_value() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要写入元数据
     // - 目的: 确保写接口生效
-    let _ = sm
-        .update_meta("last_snapshot_at".to_string(), "123".to_string())
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    sm.update_meta("last_snapshot_at".to_string(), "123".to_string())
         .await
         .unwrap();
 

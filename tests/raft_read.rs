@@ -60,7 +60,10 @@ async fn snapshot_created_when_time_exceeds_window() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要创建表
     // - 目的: 触发写入时间更新
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .write("CREATE TABLE t(x INT)".to_string())
         .await
         .unwrap();
@@ -68,7 +71,10 @@ async fn snapshot_created_when_time_exceeds_window() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要模拟超时
     // - 目的: 强制触发快照
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .update_meta("last_snapshot_at".to_string(), "0".to_string())
         .await
         .unwrap();
@@ -116,11 +122,17 @@ async fn snapshot_updates_meta_after_creation() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要触发写入
     // - 目的: 生成 last_write_at
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .write("CREATE TABLE t(x INT)".to_string())
         .await
         .unwrap();
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .write("INSERT INTO t(x) VALUES (1)".to_string())
         .await
         .unwrap();
@@ -128,7 +140,10 @@ async fn snapshot_updates_meta_after_creation() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要模拟超时
     // - 目的: 强制触发快照
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .update_meta("last_snapshot_at".to_string(), "0".to_string())
         .await
         .unwrap();
@@ -180,11 +195,17 @@ async fn wal_rotates_after_snapshot() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要触发写入
     // - 目的: 生成 WAL 文件
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .write("CREATE TABLE t(x INT)".to_string())
         .await
         .unwrap();
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .write("INSERT INTO t(x) VALUES (1)".to_string())
         .await
         .unwrap();
@@ -192,7 +213,10 @@ async fn wal_rotates_after_snapshot() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要模拟超时
     // - 目的: 强制触发快照
-    let _ = router
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要满足 clippy let_unit_value
+    // - 目的: 移除无意义绑定并保持语义
+    router
         .update_meta("last_snapshot_at".to_string(), "0".to_string())
         .await
         .unwrap();

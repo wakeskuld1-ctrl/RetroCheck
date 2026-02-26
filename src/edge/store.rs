@@ -5,12 +5,38 @@
 // ### 修改记录 (2026-02-25)
 // - 原因: 需要统一错误类型
 // - 目的: 让上层测试使用 anyhow 处理错误
+// ### 修改记录 (2026-02-26)
+// - 原因: 需要在边缘层引入配置读取
+// - 目的: 支撑 A/B 清理阈值配置
 use anyhow::Result;
+// ### 修改记录 (2026-02-26)
+// - 原因: 需要引用 EdgeConfig
+// - 目的: 将配置注入 EdgeStore
+use crate::config::EdgeConfig;
+// ### 修改记录 (2026-02-26)
+// - 原因: 需要记录清理耗时
+// - 目的: 支撑性能测试统计
+use std::sync::atomic::{AtomicU64, Ordering};
+// ### 修改记录 (2026-02-26)
+// - 原因: 需要统计清理耗时
+// - 目的: 记录清理执行时长
+use std::time::Instant;
 
 /// ### 修改记录 (2026-02-25)
 /// - 原因: 需要固定元数据键
 /// - 目的: 保证活动指针读写一致
+/// ### 修改记录 (2026-02-26)
+/// - 原因: A/B 切换需要统一元数据入口
+/// - 目的: 支撑活动槽位持久化
 const ACTIVE_SLOT_KEY: &str = "edge_active_slot";
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要区分 A/B 槽位前缀
+/// - 目的: 让物理键空间隔离
+const SLOT0_PREFIX: &[u8] = b"slot0:";
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要区分 A/B 槽位前缀
+/// - 目的: 让物理键空间隔离
+const SLOT1_PREFIX: &[u8] = b"slot1:";
 /// ### 修改记录 (2026-02-25)
 /// - 原因: 需要统一日志前缀
 /// - 目的: 支撑前缀扫描顺序
@@ -31,6 +57,14 @@ const HWM_KEY: &str = "edge_hwm";
 /// - 原因: 需要 cmd 命名空间前缀
 /// - 目的: 前缀扫描覆盖指令数据
 const CMD_PREFIX: &[u8] = b"cmd:";
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要持久化槽位计数
+/// - 目的: 支撑清理阈值判断
+const SLOT0_COUNT_KEY: &str = "edge_slot0_count";
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要持久化槽位计数
+/// - 目的: 支撑清理阈值判断
+const SLOT1_COUNT_KEY: &str = "edge_slot1_count";
 /// ### 修改记录 (2026-02-25)
 /// - 原因: 需要持久化 cmd 断点
 /// - 目的: 断电恢复后续扫
@@ -44,17 +78,85 @@ pub struct EdgeStore {
     /// - 原因: 需要持久化 KV
     /// - 目的: 支撑断电恢复与前缀扫描测试
     db: sled::Db,
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要保存 A/B 配置
+    /// - 目的: 在写入时判断清理阈值
+    config: EdgeConfig,
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要记录最近一次清理耗时
+    /// - 目的: 供性能测试断言
+    last_cleanup_ms: AtomicU64,
+}
+
+// ### 修改记录 (2026-02-26)
+// - 原因: 需要暴露调试统计
+// - 目的: 供测试验证计数与耗时
+#[cfg(any(test, debug_assertions))]
+pub struct EdgeDebugStats {
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要读取槽位计数
+    // - 目的: 验证清理是否重置计数
+    pub slot0_count: u64,
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要读取槽位计数
+    // - 目的: 验证清理是否重置计数
+    pub slot1_count: u64,
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要读取清理耗时
+    // - 目的: 覆盖性能冒烟断言
+    pub last_cleanup_ms: u64,
 }
 
 impl EdgeStore {
     /// ### 修改记录 (2026-02-25)
     /// - 原因: 需要从目录初始化存储
     /// - 目的: 允许断电重启复用同一目录
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要默认配置启动
+    /// - 目的: 在无配置文件时保持行为稳定
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        // ### 修改记录 (2026-02-25)
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要默认配置
+        // - 目的: 避免调用方必须提供配置
+        Self::open_with_config(path, EdgeConfig::default())
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要通过配置构造 EdgeStore
+    /// - 目的: 支撑 A/B 清理阈值由外部控制
+    pub fn open_with_config(path: &std::path::Path, config: EdgeConfig) -> Result<Self> {
+        // ### 修改记录 (2026-02-26)
         // - 原因: sled 打开可能失败
         // - 目的: 将错误交由上层处理
-        Ok(Self { db: sled::open(path)? })
+        let db = sled::open(path)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要保存配置
+        // - 目的: 让清理逻辑可读到阈值
+        Ok(Self {
+            db,
+            config,
+            // ### 修改记录 (2026-02-26)
+            // - 原因: 需要清理耗时默认值
+            // - 目的: 让测试可判断是否已记录
+            last_cleanup_ms: AtomicU64::new(0),
+        })
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要从配置文件构造 EdgeStore
+    /// - 目的: 满足键计数配置文件管理要求
+    pub fn open_with_config_file(
+        path: &std::path::Path,
+        config_path: &std::path::Path,
+    ) -> Result<Self> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要加载配置文件
+        // - 目的: 获得清理阈值
+        let config = EdgeConfig::load_from_file(config_path)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要复用统一构造逻辑
+        // - 目的: 减少配置分支重复
+        Self::open_with_config(path, config)
     }
 
     /// ### 修改记录 (2026-02-25)
@@ -86,21 +188,234 @@ impl EdgeStore {
         Ok(value.map(|v| v[0]).unwrap_or(0))
     }
 
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要测试读取调试统计
+    /// - 目的: 支撑清理计数与耗时断言
+    #[cfg(any(test, debug_assertions))]
+    pub fn debug_stats(&self) -> Result<EdgeDebugStats> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取槽位计数
+        // - 目的: 验证清理后的计数状态
+        let slot0_count = self.get_slot_count(0)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取槽位计数
+        // - 目的: 验证清理后的计数状态
+        let slot1_count = self.get_slot_count(1)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取清理耗时
+        // - 目的: 覆盖性能冒烟断言
+        let last_cleanup_ms = self.last_cleanup_ms.load(Ordering::Relaxed);
+        Ok(EdgeDebugStats {
+            slot0_count,
+            slot1_count,
+            last_cleanup_ms,
+        })
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要在不可恢复时提供默认槽位
+    /// - 目的: 让键构造接口保持非 Result
+    fn active_slot_or_zero(&self) -> u8 {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 读取活动槽位可能失败
+        // - 目的: 保持调用方接口稳定
+        self.get_active_slot().unwrap_or(0)
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要将槽位映射为前缀
+    /// - 目的: 支撑 A/B 槽隔离
+    fn slot_prefix_for(slot: u8) -> &'static [u8] {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 仅支持双槽位
+        // - 目的: 简化槽位映射逻辑
+        if slot == 0 {
+            SLOT0_PREFIX
+        } else {
+            SLOT1_PREFIX
+        }
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要拼接槽位前缀与命名空间
+    /// - 目的: 统一键构造逻辑
+    fn prefixed_namespace(&self, slot: u8, namespace: &[u8]) -> Vec<u8> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要组合 slot 与 namespace
+        // - 目的: 让 scan_prefix 只遍历当前槽位
+        let slot_prefix = Self::slot_prefix_for(slot);
+        let mut buf = Vec::with_capacity(slot_prefix.len() + namespace.len());
+        buf.extend_from_slice(slot_prefix);
+        buf.extend_from_slice(namespace);
+        buf
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要拼接槽位前缀、命名空间与后缀
+    /// - 目的: 构造完整业务键
+    fn prefixed_key(&self, slot: u8, namespace: &[u8], tail: &[u8]) -> Vec<u8> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要组合所有片段
+        // - 目的: 得到最终存储键
+        let slot_prefix = Self::slot_prefix_for(slot);
+        let mut buf = Vec::with_capacity(slot_prefix.len() + namespace.len() + tail.len());
+        buf.extend_from_slice(slot_prefix);
+        buf.extend_from_slice(namespace);
+        buf.extend_from_slice(tail);
+        buf
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要持久化槽位计数
+    /// - 目的: 让清理阈值判断可落盘
+    fn slot_count_key(slot: u8) -> &'static str {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 仅支持双槽位
+        // - 目的: 简化映射逻辑
+        if slot == 0 {
+            SLOT0_COUNT_KEY
+        } else {
+            SLOT1_COUNT_KEY
+        }
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要读取槽位计数
+    /// - 目的: 判断是否达到清理阈值
+    fn get_slot_count(&self, slot: u8) -> Result<u64> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取持久化计数
+        // - 目的: 断电后仍保持计数
+        let value = self.db.get(Self::slot_count_key(slot))?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要默认 0
+        // - 目的: 未写入时避免 panic
+        Ok(value
+            .map(|v| {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&v[0..8]);
+                u64::from_be_bytes(buf)
+            })
+            .unwrap_or(0))
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要写入槽位计数
+    /// - 目的: 让计数可持久化
+    fn set_slot_count(&self, slot: u8, value: u64) -> Result<()> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: sled 需要 IVec
+        // - 目的: 持久化槽位计数
+        self.db
+            .insert(Self::slot_count_key(slot), value.to_be_bytes().to_vec())?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要尽快落盘
+        // - 目的: 断电恢复可继续计数
+        self.db.flush()?;
+        Ok(())
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要自增槽位计数
+    /// - 目的: 在写入时更新计数
+    fn increment_slot_count(&self, slot: u8) -> Result<u64> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取旧值
+        // - 目的: 计算新计数
+        let current = self.get_slot_count(slot)?;
+        let next = current.saturating_add(1);
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要写回新值
+        // - 目的: 保持计数连续
+        self.set_slot_count(slot, next)?;
+        Ok(next)
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要清理非活动槽位数据
+    /// - 目的: 达到阈值后释放空间
+    fn cleanup_slot(&self, slot: u8) -> Result<()> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要统计清理耗时
+        // - 目的: 记录清理执行时长
+        let started = Instant::now();
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要收集待删除键
+        // - 目的: 避免迭代中删除
+        let mut keys = Vec::new();
+        let slot_prefix = Self::slot_prefix_for(slot);
+        for item in self.db.scan_prefix(slot_prefix) {
+            let (key, _value) = item?;
+            keys.push(key.to_vec());
+        }
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要逐个删除
+        // - 目的: 清理槽位内全部数据
+        for key in keys {
+            self.db.remove(key)?;
+        }
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要重置计数
+        // - 目的: 让阈值判定回到初始
+        self.set_slot_count(slot, 0)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要确保删除落盘
+        // - 目的: 避免断电后残留
+        self.db.flush()?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要记录清理耗时
+        // - 目的: 供性能测试读取
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        self.last_cleanup_ms.store(elapsed_ms, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// ### 修改记录 (2026-02-26)
+    /// - 原因: 需要在达到阈值时触发清理
+    /// - 目的: 实现延迟清理语义
+    fn maybe_cleanup_other_slot(&self, active_slot: u8, active_count: u64) -> Result<()> {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要获得非活动槽位
+        // - 目的: 清理旧槽位数据
+        let other_slot = if active_slot == 0 { 1 } else { 0 };
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取旧槽位计数
+        // - 目的: 计算比例阈值
+        let other_count = self.get_slot_count(other_slot)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 没有旧数据无需清理
+        // - 目的: 减少无意义删除
+        if other_count == 0 {
+            return Ok(());
+        }
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要比例阈值计算
+        // - 目的: 达到阈值时触发清理
+        let threshold = (other_count as f64) * self.config.ab_cleanup_ratio;
+        if (active_count as f64) >= threshold {
+            return self.cleanup_slot(other_slot);
+        }
+        Ok(())
+    }
+
     /// ### 修改记录 (2026-02-25)
     /// - 原因: 需要构造可排序的日志键
     /// - 目的: 保障字典序等于时间序
     pub fn log_key(&self, ts: u64, seq: u64) -> Vec<u8> {
-        // ### 修改记录 (2026-02-25)
-        // - 原因: 需要前缀区分日志空间
-        // - 目的: 前缀扫描可只覆盖日志
-        let mut key = Vec::with_capacity(LOG_PREFIX.len() + 16);
-        key.extend_from_slice(LOG_PREFIX);
-        // ### 修改记录 (2026-02-25)
-        // - 原因: 需要保持大端排序
-        // - 目的: 确保字典序与时间序一致
-        key.extend_from_slice(&ts.to_be_bytes());
-        key.extend_from_slice(&seq.to_be_bytes());
-        key
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取活动槽位
+        // - 目的: 在键中带上槽位前缀
+        let slot = self.active_slot_or_zero();
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要组合后缀
+        // - 目的: 保持大端排序
+        let mut tail = Vec::with_capacity(16);
+        tail.extend_from_slice(&ts.to_be_bytes());
+        tail.extend_from_slice(&seq.to_be_bytes());
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要添加槽位前缀
+        // - 目的: A/B 数据空间隔离
+        self.prefixed_key(slot, LOG_PREFIX, &tail)
     }
 
     /// ### 修改记录 (2026-02-25)
@@ -119,6 +434,15 @@ impl EdgeStore {
         // - 原因: 需要尽快落盘
         // - 目的: 断电恢复可重放
         self.db.flush()?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要更新槽位写入计数
+        // - 目的: 判断是否达到清理阈值
+        let active_slot = self.get_active_slot()?;
+        let active_count = self.increment_slot_count(active_slot)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要可能触发清理
+        // - 目的: 达到阈值时清理旧槽
+        self.maybe_cleanup_other_slot(active_slot, active_count)?;
         Ok(())
     }
 
@@ -130,18 +454,37 @@ impl EdgeStore {
         // - 原因: 需要遍历前缀
         // - 目的: 限定扫描范围
         let mut result = Vec::new();
-        // ### 修改记录 (2026-02-25)
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要获取当前槽位
+        // - 目的: 只扫描活动槽位
+        let slot = self.get_active_slot()?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要组合槽位前缀
+        // - 目的: 限定扫描范围
+        let prefix = self.prefixed_namespace(slot, LOG_PREFIX);
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要容错非法断点
+        // - 目的: 非本槽位前缀视为无断点
+        let last_key = match last_key {
+            Some(key) if key.starts_with(prefix.as_slice()) => Some(key),
+            Some(_) => None,
+            None => None,
+        };
+        // ### 修改记录 (2026-02-26)
         // - 原因: 需要断点过滤
         // - 目的: 断电恢复从断点继续
-        for item in self.db.scan_prefix(LOG_PREFIX) {
+        for item in self.db.scan_prefix(prefix.as_slice()) {
             let (key, _value) = item?;
             // ### 修改记录 (2026-02-25)
             // - 原因: 需要跳过已扫描键
             // - 目的: 避免重复上传
-            if let Some(ref last) = last_key {
-                if key.as_ref() <= last.as_slice() {
-                    continue;
-                }
+            // ### 修改记录 (2026-02-26)
+            // - 原因: 需要满足 clippy collapsible_if
+            // - 目的: 简化条件分支并保持原语义
+            if let Some(ref last) = last_key
+                && key.as_ref() <= last.as_slice()
+            {
+                continue;
             }
             result.push(key.to_vec());
         }
@@ -152,17 +495,20 @@ impl EdgeStore {
     /// - 原因: 需要构造 cmd 键
     /// - 目的: 支撑前缀扫描与断点续扫
     pub fn cmd_key(&self, ts: u64, seq: u64) -> Vec<u8> {
-        // ### 修改记录 (2026-02-25)
-        // - 原因: 需要前缀区分 cmd 空间
-        // - 目的: cmd 与 log 分离
-        let mut key = Vec::with_capacity(CMD_PREFIX.len() + 16);
-        key.extend_from_slice(CMD_PREFIX);
-        // ### 修改记录 (2026-02-25)
-        // - 原因: 需要保持大端排序
-        // - 目的: 确保字典序与时间序一致
-        key.extend_from_slice(&ts.to_be_bytes());
-        key.extend_from_slice(&seq.to_be_bytes());
-        key
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取活动槽位
+        // - 目的: 在键中带上槽位前缀
+        let slot = self.active_slot_or_zero();
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要组合后缀
+        // - 目的: 保持大端排序
+        let mut tail = Vec::with_capacity(16);
+        tail.extend_from_slice(&ts.to_be_bytes());
+        tail.extend_from_slice(&seq.to_be_bytes());
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要添加槽位前缀
+        // - 目的: A/B 数据空间隔离
+        self.prefixed_key(slot, CMD_PREFIX, &tail)
     }
 
     /// ### 修改记录 (2026-02-25)
@@ -187,6 +533,15 @@ impl EdgeStore {
         // - 原因: 需要尽快落盘
         // - 目的: 断电恢复可重放
         self.db.flush()?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要更新槽位写入计数
+        // - 目的: 判断是否达到清理阈值
+        let active_slot = self.get_active_slot()?;
+        let active_count = self.increment_slot_count(active_slot)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要可能触发清理
+        // - 目的: 达到阈值时清理旧槽
+        self.maybe_cleanup_other_slot(active_slot, active_count)?;
         Ok(())
     }
 
@@ -202,6 +557,15 @@ impl EdgeStore {
         // - 原因: 需要尽快落盘
         // - 目的: 断电后仍可读取
         self.db.flush()?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要更新槽位写入计数
+        // - 目的: 判断是否达到清理阈值
+        let active_slot = self.get_active_slot()?;
+        let active_count = self.increment_slot_count(active_slot)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要可能触发清理
+        // - 目的: 达到阈值时清理旧槽
+        self.maybe_cleanup_other_slot(active_slot, active_count)?;
         Ok(())
     }
 
@@ -213,26 +577,37 @@ impl EdgeStore {
         // - 原因: 需要遍历前缀
         // - 目的: 限定扫描范围
         let mut result = Vec::new();
-        // ### 修改记录 (2026-02-25)
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要获取当前槽位
+        // - 目的: 只扫描活动槽位
+        let slot = self.get_active_slot()?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要组合槽位前缀
+        // - 目的: 限定扫描范围
+        let prefix = self.prefixed_namespace(slot, CMD_PREFIX);
+        // ### 修改记录 (2026-02-26)
         // - 原因: 需要容错非法断点
-        // - 目的: 非 cmd 前缀视为无断点
+        // - 目的: 非本槽位前缀视为无断点
         let last_key = match last_key {
-            Some(key) if key.starts_with(CMD_PREFIX) => Some(key),
+            Some(key) if key.starts_with(prefix.as_slice()) => Some(key),
             Some(_) => None,
             None => None,
         };
         // ### 修改记录 (2026-02-25)
         // - 原因: 需要断点过滤
         // - 目的: 断电恢复从断点继续
-        for item in self.db.scan_prefix(CMD_PREFIX) {
+        for item in self.db.scan_prefix(prefix.as_slice()) {
             let (key, _value) = item?;
             // ### 修改记录 (2026-02-25)
             // - 原因: 需要跳过已扫描键
             // - 目的: 避免重复执行
-            if let Some(ref last) = last_key {
-                if key.as_ref() <= last.as_slice() {
-                    continue;
-                }
+            // ### 修改记录 (2026-02-26)
+            // - 原因: 需要满足 clippy collapsible_if
+            // - 目的: 简化条件分支并保持原语义
+            if let Some(ref last) = last_key
+                && key.as_ref() <= last.as_slice()
+            {
+                continue;
             }
             result.push(key.to_vec());
         }
@@ -304,13 +679,19 @@ impl EdgeStore {
     /// - 原因: 需要构造 TTL 键
     /// - 目的: 支撑 TTL 过期丢弃测试
     fn ttl_key(&self, key: u64) -> Vec<u8> {
-        // ### 修改记录 (2026-02-25)
-        // - 原因: 需要前缀区分命名空间
-        // - 目的: 避免与日志/元数据冲突
-        let mut buf = Vec::with_capacity(TTL_PREFIX.len() + 8);
-        buf.extend_from_slice(TTL_PREFIX);
-        buf.extend_from_slice(&key.to_be_bytes());
-        buf
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要读取活动槽位
+        // - 目的: 在键中带上槽位前缀
+        let slot = self.active_slot_or_zero();
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要组合后缀
+        // - 目的: 保持大端排序
+        let mut tail = Vec::with_capacity(8);
+        tail.extend_from_slice(&key.to_be_bytes());
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要添加槽位前缀
+        // - 目的: A/B 数据空间隔离
+        self.prefixed_key(slot, TTL_PREFIX, &tail)
     }
 
     /// ### 修改记录 (2026-02-25)
@@ -348,6 +729,15 @@ impl EdgeStore {
         // - 原因: 需要尽快落盘
         // - 目的: 断电后仍可判断过期
         self.db.flush()?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要更新槽位写入计数
+        // - 目的: 判断是否达到清理阈值
+        let active_slot = self.get_active_slot()?;
+        let active_count = self.increment_slot_count(active_slot)?;
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要可能触发清理
+        // - 目的: 达到阈值时清理旧槽
+        self.maybe_cleanup_other_slot(active_slot, active_count)?;
         Ok(())
     }
 

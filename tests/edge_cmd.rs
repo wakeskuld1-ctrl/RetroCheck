@@ -77,7 +77,9 @@ fn cmd_payload_expired_or_broken_is_dropped() {
     // - 原因: 需要验证重复读取
     // - 目的: 删除后仍返回 None
     let broken_key = store.cmd_key(2, 2);
-    store.put_cmd_raw(broken_key.clone(), vec![1, 2, 3]).unwrap();
+    store
+        .put_cmd_raw(broken_key.clone(), vec![1, 2, 3])
+        .unwrap();
     let payload = store.get_cmd_payload(&broken_key).unwrap();
     assert!(payload.is_none());
     let payload = store.get_cmd_payload(&broken_key).unwrap();
@@ -143,7 +145,9 @@ fn cmd_payload_respects_future_and_boundary_expire() {
     // ### 修改记录 (2026-02-25)
     // - 原因: 需要未来过期
     // - 目的: 应当可读
-    store.put_cmd(4, 1, now_ms + 1000, b"live".to_vec()).unwrap();
+    store
+        .put_cmd(4, 1, now_ms + 1000, b"live".to_vec())
+        .unwrap();
     let payload = store.get_cmd_payload(&store.cmd_key(4, 1)).unwrap();
     assert!(payload.is_some());
     // ### 修改记录 (2026-02-25)

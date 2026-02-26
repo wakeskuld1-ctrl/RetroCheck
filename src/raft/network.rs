@@ -70,3 +70,15 @@ impl TestNetwork {
         node.apply_sql_for_test(sql).await
     }
 }
+
+// ### 修改记录 (2026-02-26)
+// - 原因: 需要满足 clippy new_without_default
+// - 目的: 提供默认构造入口
+impl Default for TestNetwork {
+    fn default() -> Self {
+        // ### 修改记录 (2026-02-26)
+        // - 原因: 需要复用 new
+        // - 目的: 保持构造行为一致
+        Self::new()
+    }
+}
