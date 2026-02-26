@@ -8,12 +8,14 @@
 ## 1. Background and Goals
 To achieve strong consistency and fault tolerance across multiple SQLite nodes, the internal write path is driven by Raft. Raft handles log replication and commit, SQLite is the state machine for business data, and sled persists Raft metadata and logs.
 
+> **Note**: The Raft core is implemented using OpenRaft, but peer-to-peer communication currently uses in-memory channels (RaftRouter). gRPC is used for Client-Server communication only. ReadIndex is not yet exposed to the Router.
+
 ## 2. Core Components
 - **Router**: Server-side entry for write/read requests.
-- **RaftNode**: Wraps the Raft core and orchestrates replication.
+- **RaftNode**: Wraps the OpenRaft core and orchestrates replication.
 - **RaftStore**: Persists Raft logs and metadata using sled.
 - **SqliteStateMachine**: Applies committed SQL to SQLite.
-- **RaftNetwork**: RPC adapter for Raft peer communication.
+- **RaftNetwork**: In-memory simulation (RaftRouter) for Raft peer communication.
 - **gRPC Service**: Exposes DatabaseService to clients.
 
 ## 3. Class Diagram
@@ -75,8 +77,25 @@ sequenceDiagram
 ```
 
 ## 5. Read Path Notes
-- **Linearizable read**: Prefer leader read-index (when available) to ensure read-after-write consistency.
-- **No leader**: Reads fail with an error to avoid unsafe fallback.
+- **Current Status**: Direct local read from SQLite state machine.
+- **Planned**:
+  - **Linearizable read**: Prefer leader read-index (when available) to ensure read-after-write consistency.
+  - **No leader**: Reads should fail or be forwarded.
+
+## 7. AIoT Architecture Evolution & Gap Analysis
+Based on the new "Cloud-Edge-End AIoT" vision, the following gaps exist in the current implementation:
+
+### 7.1 Infrastructure Layer
+- **Raft Network**: Currently uses in-memory simulation (`RaftRouter`). Needs migration to a real gRPC/Protobuf-based network layer for multi-node deployment.
+- **Linearizable Read (ReadIndex)**: The `Router` needs to expose the `read_index` interface to ensure strong consistency when reading from Followers, instead of direct local state machine reads.
+
+### 7.2 AI Decision Core
+- **TinyLLM Integration**: The Hub currently only handles storage. It lacks an AI inference runtime (e.g., `candle` or `ort`) and model loading mechanisms.
+- **DecisionMaker**: Missing the glue layer between the rule engine and AI modules to trigger control instructions based on Raft state changes.
+
+### 7.3 Hub-Edge Synergy
+- **Control Protocol**: Missing standardized instruction dispatch channel (Hub -> Edge).
+- **Data Reporting**: Missing sensing data reporting pipeline and buffering mechanisms (Edge -> Hub).
 
 ## 6. Usage
 ### 6.1 Server CLI

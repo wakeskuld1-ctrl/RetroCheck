@@ -1,6 +1,9 @@
 # Raft-based SQLite Distributed Cluster (Rust)
 
 ## Change Log
+- **Reason**: Optimize Cloud-Edge-End architecture diagram to reflect Embedded AIoT Data Foundation (Tiny LLM + Real-time Decision).
+- **Goal**: Align with the new vision of Hub as an AI decision core supervising Edge execution.
+- **Time**: 2026-02-27
 - **Reason**: Add cloud-edge-end architecture diagram and clarify status/verification commands.
 - **Goal**: Keep README aligned with current topology and workflow.
 - **Time**: 2026-02-26
@@ -94,16 +97,64 @@ sequenceDiagram
     Server-->>Client: ExecuteResponse
 ```
 
-## Cloud-Edge-End Architecture
+## Cloud-Edge-End AIoT Architecture (Embedded Data Foundation)
 ```mermaid
-flowchart LR
-    Cloud[Cloud Control Plane\nConfig/Monitor] --> Hub[Hub Cluster\nRaft + SQLite]
-    Hub <---> Network[Network Transport\ngRPC/Protobuf]
-    Network <---> Edge[Edge Nodes\nA/B Store + TTL]
-    Edge --> Devices[Local Devices/Apps]
+flowchart TB
+    subgraph Cloud [Cloud Layer]
+        direction TB
+        ModelTrain[Model Training/Fine-tuning]
+        GlobalPolicy[Global Policy Dispatch]
+    end
+
+    subgraph Hub [Hub Layer - AI Decision Core]
+        direction TB
+        TinyLLM[Tiny LLM / Decision Engine]
+        RaftCluster[Raft Consensus (SQLite)]
+        DecisionMaker[Real-time Decision & Supervision]
+        
+        TinyLLM <--> RaftCluster
+        TinyLLM --> DecisionMaker
+    end
+
+    subgraph Edge [Edge Layer - Execution & Sensing]
+        direction TB
+        EdgeStore[A/B Storage (Sled)]
+        ExecUnit[Instruction Execution]
+        DataBuffer[Data Buffer]
+    end
+
+    subgraph Devices [Device Layer]
+        Sensor[Sensors]
+        Actuator[Actuators]
+    end
+
+    Cloud ==>|Model Weights/Policy| Hub
+    Hub ==>|Status Report| Cloud
+
+    Hub ==>|Control Instructions| Edge
+    Edge ==>|Sensing Data| Hub
+
+    Edge <--> Devices
 ```
 
-## Directory Layout
+## Roadmap
+
+### 1. Infrastructure (Data Foundation)
+- [ ] **Raft Network**: Migrate internal communication from in-memory (`RaftRouter`) to **gRPC** for real distributed deployment.
+- [ ] **Linearizable Read**: Implement `ReadIndex` to ensure strong consistency when reading from Followers.
+- [ ] **Storage Optimization**: Adapt Sled storage for **Vector Indexing** or **Time-series Data** to support efficient AI inference inputs.
+
+### 2. AI Decision Core (Hub)
+- [ ] **Model Management**: Implement mechanism to receive and hot-reload **Tiny LLM weights** from Cloud.
+- [ ] **Embedded Inference**: Integrate `candle` or `ort` to run AI inference locally on Hub nodes.
+- [ ] **Real-time Decision Loop**: Build `DecisionMaker` to listen to Raft state changes -> trigger inference -> generate control instructions.
+
+### 3. Hub-Edge Supervision
+- [ ] **Control Protocol**: Define standardized Hub -> Edge control instruction set (Protobuf).
+- [ ] **Sensing Data Pipeline**: Implement high-frequency data reporting pipeline from Edge to Hub with buffering.
+- [ ] **Execution Supervision**: Monitor Edge execution status (Ack/Result) and feed back to the decision engine for policy correction.
+
+## Directory Structure
 ```text
 .
 ├── Cargo.toml

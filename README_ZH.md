@@ -1,6 +1,9 @@
 # 基于 Raft 的 SQLite 分布式集群（Rust）
 
 ## 修改记录
+- **原因**：优化云-端-边架构图，体现嵌入式 AIoT 数据底座设计（微型 LLM + 实时决策）。
+- **目的**：反映 Hub 作为 AI 决策核心、督导 Edge 执行的新架构愿景。
+- **时间**：2026-02-27
 - **原因**：补充云-端-边架构图并完善现状与验证命令说明。
 - **目的**：保证 README 与当前拓扑和工作流一致。
 - **时间**：2026-02-26
@@ -91,14 +94,62 @@ sequenceDiagram
     Service-->>Client: ExecuteResponse
 ```
 
-## 云-端-边架构图
+## 云-端-边 AIoT 架构图 (嵌入式数据底座)
 ```mermaid
-flowchart LR
-    Cloud[云控制面\n配置/监控] --> Hub[端侧集群\nRaft + SQLite]
-    Hub <---> Network[网络传输\ngRPC/Protobuf]
-    Network <---> Edge[边缘节点\nA/B 存储 + TTL]
-    Edge --> Devices[本地设备/应用]
+flowchart TB
+    subgraph Cloud [云端 (Cloud)]
+        direction TB
+        ModelTrain[模型训练/微调]
+        GlobalPolicy[全局策略下发]
+    end
+
+    subgraph Hub [中枢 (Hub) - AI 决策核心]
+        direction TB
+        TinyLLM[微型 LLM / 决策引擎]
+        RaftCluster[Raft 共识存储 (SQLite)]
+        DecisionMaker[实时决策与督导]
+        
+        TinyLLM <--> RaftCluster
+        TinyLLM --> DecisionMaker
+    end
+
+    subgraph Edge [边缘 (Edge) - 执行与感知]
+        direction TB
+        EdgeStore[A/B 存储 (Sled)]
+        ExecUnit[指令执行]
+        DataBuffer[数据缓冲]
+    end
+
+    subgraph Devices [设备 (Devices)]
+        Sensor[传感器]
+        Actuator[执行器]
+    end
+
+    Cloud ==>|模型权重/策略| Hub
+    Hub ==>|状态上报| Cloud
+
+    Hub ==>|控制指令| Edge
+    Edge ==>|感知数据| Hub
+
+    Edge <--> Devices
 ```
+
+## 下一步计划 (Roadmap)
+
+### 1. 基础设施增强 (数据底座)
+- [ ] **Raft 网络通信**：将内部通信从内存模拟 (`RaftRouter`) 迁移至 **gRPC**，支持真实分布式部署。
+- [ ] **线性一致读**：实现 `ReadIndex` 机制，确保从 Follower 读取数据的一致性。
+- [ ] **存储引擎适配**：优化 Sled 存储结构，以支持 **向量索引** 或 **时序数据**，为 AI 推理提供高效输入。
+
+### 2. AI 决策中枢 (Hub)
+- [ ] **模型管理与热更**：实现从云端接收并热更新 **微型 LLM 模型权重** 的机制。
+- [ ] **嵌入式推理运行时**：集成 `candle` 或 `ort`，在 Hub 节点本地运行 AI 推理。
+- [ ] **实时决策闭环**：构建 `DecisionMaker`，监听 Raft 状态机变更流 -> 触发推理 -> 生成控制指令。
+
+### 3. 端边协同与督导 (Edge Supervision)
+- [ ] **指令下发协议**：定义标准化的 Hub -> Edge 控制指令集 (Protobuf)。
+- [ ] **感知数据上报**：实现 Edge -> Hub 的高频数据上报管道与缓冲策略。
+- [ ] **执行督导**：监控 Edge 对指令的执行状态（Ack/Result），并反馈给决策引擎以修正策略。
 
 ## 目录结构
 ```text
