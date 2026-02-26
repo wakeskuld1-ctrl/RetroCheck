@@ -1,6 +1,9 @@
 # 基于 Raft 的 SQLite 分布式集群（Rust）
 
-## 修改记录 (2026-02-18)
+## 修改记录
+- **原因**：补充云-端-边架构图并完善现状与验证命令说明。
+- **目的**：保证 README 与当前拓扑和工作流一致。
+- **时间**：2026-02-26
 - **原因**：提供中文 README 并补充已测试场景说明。
 - **目的**：与英文 README 保持结构一致，便于中文读者理解与验证。
 - **时间**：2026-02-18
@@ -15,6 +18,11 @@
 - **线性一致读路径**：通过 leader 的 read-index（如可用）。
 - **gRPC 兼容**：保留 `Execute`、`GetVersion` 与健康检查。
 - **脚本化验证**：使用 `verify.ps1` 覆盖故障场景。
+
+## 当前实现状态
+- **边**：A/B 槽位切换、延迟清理、槽位前缀隔离、清理阈值可配置。
+- **端**：Raft 写入路径 + SQLite 状态机已就位，Smart Batcher 阈值待固化。
+- **云**：管理与监控入口规划中，与端/边对接方式待细化。
 
 ## 架构
 ### 组件
@@ -83,6 +91,15 @@ sequenceDiagram
     Service-->>Client: ExecuteResponse
 ```
 
+## 云-端-边架构图
+```mermaid
+flowchart LR
+    Cloud[云控制面\n配置/监控] --> Hub[端侧集群\nRaft + SQLite]
+    Hub <---> Network[网络传输\ngRPC/Protobuf]
+    Network <---> Edge[边缘节点\nA/B 存储 + TTL]
+    Edge --> Devices[本地设备/应用]
+```
+
 ## 目录结构
 ```text
 .
@@ -145,6 +162,15 @@ cargo run --bin client -- --master-addr http://127.0.0.1:50051 --slave-addrs htt
 ./verify.ps1 -Scenario prepare_commit_kill
 ```
 
+### 开发与验证命令
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --test edge_ab
+cargo test
+cargo check
+```
+
 ## Tested Scenarios / 已测试场景与情况
 1) **用途**：验证从建表到写入再到一致性校验的完整流程。  
    **关键检查点**：DDL 执行、原子写入、版本递增、跨节点一致性校验。  
@@ -173,6 +199,9 @@ cargo run --bin client -- --master-addr http://127.0.0.1:50051 --slave-addrs htt
 - **Leader 依赖**：无 Leader 时写入会失败，需等待选主完成。
 
 ## 下一步规划
+- 边：完善 A/B 清理阈值策略并补充运维指引。
+- 端：固化 Smart Batcher 阈值并增加覆盖测试。
+- 云：明确配置/监控对接流程与数据面接口。
 - 2PC 提交支持多语句时，序号按语句数递增并增加对应测试。
 - ExecuteBatch 发生失败回滚时序号不递增，并补充失败与成功路径测试。
 - 非 Leader 的 get_version 保持返回 0 且不报错，增加覆盖测试。

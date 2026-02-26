@@ -1,6 +1,9 @@
 # Raft-based SQLite Distributed Cluster (Rust)
 
-## Change Log (2026-02-18)
+## Change Log
+- **Reason**: Add cloud-edge-end architecture diagram and clarify status/verification commands.
+- **Goal**: Keep README aligned with current topology and workflow.
+- **Time**: 2026-02-26
 - **Reason**: Align documentation with the Raft-based architecture and current CLI usage.
 - **Goal**: Provide an English primary guide with required notes, usage, and diagrams.
 - **Time**: 2026-02-18
@@ -18,6 +21,11 @@ This project implements a Raft-backed distributed SQLite cluster in Rust. Writes
 - **Linearizable read path** via leader read-index strategy (where available).
 - **gRPC compatibility** with `Execute`, `GetVersion`, and health checks.
 - **Scripted verification** with `verify.ps1` for fault scenarios.
+
+## Current Implementation Status
+- **Edge**: A/B slot switching with delayed cleanup, slot-scoped prefixing, configurable cleanup ratio.
+- **Network**: gRPC + Protobuf transport in place; custom TCP framing and FlatBuffers are planned.
+- **Hub**: Raft-based write path with SQLite state machine; smart batcher thresholds remain to be fixed.
 
 ## Architecture
 ### Components
@@ -86,6 +94,15 @@ sequenceDiagram
     Server-->>Client: ExecuteResponse
 ```
 
+## Cloud-Edge-End Architecture
+```mermaid
+flowchart LR
+    Cloud[Cloud Control Plane\nConfig/Monitor] --> Hub[Hub Cluster\nRaft + SQLite]
+    Hub <---> Network[Network Transport\ngRPC/Protobuf]
+    Network <---> Edge[Edge Nodes\nA/B Store + TTL]
+    Edge --> Devices[Local Devices/Apps]
+```
+
 ## Directory Layout
 ```text
 .
@@ -147,6 +164,15 @@ cargo run --bin client -- --master-addr http://127.0.0.1:50051 --slave-addrs htt
 ./verify.ps1 -Scenario prepare_commit_kill
 ```
 
+### Development & Verification Commands
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --test edge_ab
+cargo test
+cargo check
+```
+
 ## Tested Scenarios / 已测试场景与情况
 1) **Purpose / 用途**: Validate the full write/read flow with schema setup and consistency check.  
    **Key Checks / 关键检查点**: DDL execution, atomic writes, version increments, consistency verification across nodes.  
@@ -176,6 +202,9 @@ cargo run --bin client -- --master-addr http://127.0.0.1:50051 --slave-addrs htt
 - **Leader availability**: writes fail when no Raft leader is elected.
 
 ## Next Steps
+- Edge: finalize A/B cleanup thresholds and document operational guidance.
+- Network: implement custom TCP framing and FlatBuffers serialization.
+- Hub: solidify smart batcher thresholds with coverage tests.
 - When 2PC supports multi-statement transactions, increment the sequence by statement count and add tests.
 - Ensure ExecuteBatch does not increment the sequence on rollback, with success/failure tests.
 - Keep non-leader get_version returning 0 without error and add coverage.
