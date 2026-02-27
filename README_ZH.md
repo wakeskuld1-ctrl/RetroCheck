@@ -106,7 +106,7 @@ flowchart TB
     subgraph Hub ["中枢 (Hub) - AI 决策核心"]
         direction TB
         TinyLLM[微型 LLM / 决策引擎]
-        RaftCluster[Raft 共识存储 (SQLite)]
+        RaftCluster["Raft 共识存储 (SQLite)"]
         DecisionMaker[实时决策与督导]
         
         TinyLLM <--> RaftCluster
@@ -115,7 +115,7 @@ flowchart TB
 
     subgraph Edge ["边缘 (Edge) - 执行与感知"]
         direction TB
-        EdgeStore[A/B 存储 (Sled)]
+        EdgeStore["A/B 存储 (Sled)"]
         ExecUnit[指令执行]
         DataBuffer[数据缓冲]
     end

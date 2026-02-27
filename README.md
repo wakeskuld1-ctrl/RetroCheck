@@ -109,7 +109,7 @@ flowchart TB
     subgraph Hub ["Hub Layer - AI Decision Core"]
         direction TB
         TinyLLM[Tiny LLM / Decision Engine]
-        RaftCluster[Raft Consensus (SQLite)]
+        RaftCluster["Raft Consensus (SQLite)"]
         DecisionMaker[Real-time Decision & Supervision]
         
         TinyLLM <--> RaftCluster
@@ -118,7 +118,7 @@ flowchart TB
 
     subgraph Edge ["Edge Layer - Execution & Sensing"]
         direction TB
-        EdgeStore[A/B Storage (Sled)]
+        EdgeStore["A/B Storage (Sled)"]
         ExecUnit[Instruction Execution]
         DataBuffer[Data Buffer]
     end
