@@ -16,6 +16,22 @@ async fn raft_applies_log_to_sqlite() {
     let base_dir = std::env::temp_dir().join(format!("raft_apply_sqlite_{}", Uuid::new_v4()));
     let node = RaftNode::start_for_test(1, base_dir).await.unwrap();
 
+    // ### 修改记录 (2026-02-28)
+    // - 原因: OpenRaft 节点启动后默认为 Learner，必须显式初始化才能成为 Leader
+    // - 目的: 确保节点能处理写请求
+    let mut members = std::collections::BTreeSet::new();
+    members.insert(1);
+    node.raft.initialize(members).await.unwrap();
+    
+    // 等待成为 Leader
+    loop {
+        let metrics = node.raft.metrics().borrow().clone();
+        if metrics.state == openraft::ServerState::Leader {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要最小写入场景
     // - 目的: 验证写入与查询都可工作

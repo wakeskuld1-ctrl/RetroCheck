@@ -2,6 +2,15 @@
 //! - 原因: 需要验证 RaftStore 的持久化能力
 //! - 目的: 确保重启后元数据仍可恢复
 
+/// ### 修改记录 (2026-02-27)
+/// - 原因: 需要读取日志条目
+/// - 目的: 允许调用 try_get_log_entries
+use openraft::storage::RaftLogReader;
+/// ### 修改记录 (2026-02-27)
+/// - 原因: 需要引入日志存储 trait
+/// - 目的: 允许使用 get_log_reader
+use openraft::storage::RaftLogStorage;
+
 /// ### 修改记录 (2026-02-17)
 /// - 原因: 需要验证 last_applied 的持久化
 /// - 目的: 避免 Raft 重启后日志回放错位
@@ -72,23 +81,23 @@ async fn raft_store_appends_and_reads_logs() {
     // ### 修改记录 (2026-02-26)
     // - 原因: 需要构造最小日志条目
     // - 目的: 验证 append 的读写路径
-    let entry = openraft::Entry::<check_program::raft::types::TypeConfig>::new(
+    // ### 修改记录 (2026-02-27)
+    // - 原因: Entry::new 不存在
+    // - 目的: 使用结构体字段构造
+    let entry = openraft::Entry::<check_program::raft::types::TypeConfig> {
         // ### 修改记录 (2026-02-26)
         // - 原因: 需要构造基础 log_id
         // - 目的: 让存储层具备索引信息
-        openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+        log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
         // ### 修改记录 (2026-02-26)
         // - 原因: 需要最小载荷
         // - 目的: 保证 append 可执行
-        openraft::EntryPayload::Blank,
-    );
+        payload: openraft::EntryPayload::Blank,
+    };
     // ### 修改记录 (2026-02-26)
     // - 原因: 需要写入日志并触发回调
     // - 目的: 验证存储具备 append 能力
-    store
-        .append(vec![entry.clone()], openraft::storage::LogFlushed::noop())
-        .await
-        .unwrap();
+    store.append_for_test(vec![entry.clone()]).await.unwrap();
     // ### 修改记录 (2026-02-26)
     // - 原因: 需要获取只读日志视图
     // - 目的: 验证读取路径完整

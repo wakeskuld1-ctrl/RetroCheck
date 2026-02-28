@@ -12,6 +12,9 @@ async fn three_nodes_write_and_failover() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要最小三节点集群
     // - 目的: 验证基础 failover 路径
+    // ### 修改记录 (2026-02-28)
+    // - 原因: fail_leader 需要可变借用
+    // - 目的: 允许修改 cluster 状态
     let mut cluster = TestCluster::new(3).await.unwrap();
 
     cluster

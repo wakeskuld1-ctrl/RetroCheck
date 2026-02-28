@@ -8,6 +8,9 @@ async fn chaos_failover_and_restart_preserves_row_count() {
     // ### 修改记录 (2026-02-18)
     // - 原因: 补充测试说明以提升可维护性
     // - 目的: 标注用例关注点与流程边界
+    // ### 修改记录 (2026-02-27)
+    // - 原因: 需要调用 restart_leader
+    // - 目的: 保持可变借用
     let mut cluster = TestCluster::new(3).await.unwrap();
     // ### 修改记录 (2026-02-18)
     // - 原因: 需要确保写入路径存在
@@ -57,6 +60,9 @@ async fn chaos_repeated_failover_keeps_history_applied() {
     // ### 修改记录 (2026-02-18)
     // - 原因: 补充测试说明以提升可维护性
     // - 目的: 标注用例关注点与流程边界
+    // ### 修改记录 (2026-02-27)
+    // - 原因: fail_leader 需要可变借用
+    // - 目的: 允许修改 cluster 状态
     let mut cluster = TestCluster::new(3).await.unwrap();
     // ### 修改记录 (2026-02-18)
     // - 原因: 需要确保写入路径存在
@@ -99,6 +105,9 @@ async fn chaos_leader_restart_preserves_wal_snapshot_state() {
     // ### 修改记录 (2026-02-18)
     // - 原因: 需要覆盖连续重启恢复一致性
     // - 目的: 验证 WAL/Snapshot 路径具备稳定恢复能力
+    // ### 修改记录 (2026-02-27)
+    // - 原因: 需要调用 restart_leader
+    // - 目的: 保持可变借用
     let mut cluster = TestCluster::new(3).await.unwrap();
     // ### 修改记录 (2026-02-18)
     // - 原因: 需要确保写入路径存在

@@ -242,20 +242,50 @@ async fn wal_rotates_after_snapshot() {
     assert!(rotated_path.exists());
 }
 
-#[tokio::test]
-async fn batch_write_is_atomic_on_error() {
+/// ### 修改记录 (2026-02-28)
+/// - 原因: 统一测试初始化逻辑
+/// - 目的: 消除重复代码，避免变量遗漏导致的编译错误
+async fn setup_test_node() -> (tempfile::TempDir, check_program::raft::raft_node::RaftNode) {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("node.db");
-    let sm = check_program::raft::state_machine::SqliteStateMachine::new(
-        db_path.to_string_lossy().to_string(),
-    )
-    .unwrap();
-    sm.apply_write("CREATE TABLE t(x INT)".to_string())
+    let node_id = 1;
+    let base_dir = dir.path().to_path_buf();
+    let raft_node = check_program::raft::raft_node::RaftNode::start_local(node_id, base_dir.clone())
         .await
         .unwrap();
 
+    // Initialize Raft cluster
+    let mut members = std::collections::BTreeSet::new();
+    members.insert(node_id);
+    raft_node.raft.initialize(members).await.unwrap();
+
+    // Wait for leader election
+    loop {
+        let metrics = raft_node.raft.metrics().borrow().clone();
+        if metrics.state == openraft::ServerState::Leader {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // 确保表存在，供后续测试使用
+    raft_node
+        .state_machine
+        .apply_write("CREATE TABLE t(x INT)".to_string())
+        .await
+        .unwrap();
+    (dir, raft_node)
+}
+
+#[tokio::test]
+async fn batch_write_is_atomic_on_error() {
+    // ### 修改记录 (2026-02-28)
+    // - 原因: 使用统一辅助函数
+    // - 目的: 简化初始化代码
+    let (_dir, raft_node) = setup_test_node().await;
+    let sm = raft_node.state_machine.clone();
+
     let router = check_program::raft::router::Router::new_local_leader_with_batch(
-        db_path.to_string_lossy().to_string(),
+        raft_node,
         check_program::raft::router::BatchConfig {
             max_batch_size: 2,
             max_delay_ms: 1000,
@@ -280,18 +310,13 @@ async fn batch_write_is_atomic_on_error() {
 
 #[tokio::test]
 async fn batch_queue_overflow_returns_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("node.db");
-    let _ = check_program::raft::state_machine::SqliteStateMachine::new(
-        db_path.to_string_lossy().to_string(),
-    )
-    .unwrap()
-    .apply_write("CREATE TABLE t(x INT)".to_string())
-    .await
-    .unwrap();
+    // ### 修改记录 (2026-02-28)
+    // - 原因: 使用统一辅助函数
+    // - 目的: 简化初始化代码
+    let (_dir, raft_node) = setup_test_node().await;
 
     let router = check_program::raft::router::Router::new_local_leader_with_batch(
-        db_path.to_string_lossy().to_string(),
+        raft_node,
         check_program::raft::router::BatchConfig {
             max_batch_size: 10,
             max_delay_ms: 1000,
@@ -310,18 +335,13 @@ async fn batch_queue_overflow_returns_error() {
 
 #[tokio::test]
 async fn batch_wait_timeout_returns_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("node.db");
-    let _ = check_program::raft::state_machine::SqliteStateMachine::new(
-        db_path.to_string_lossy().to_string(),
-    )
-    .unwrap()
-    .apply_write("CREATE TABLE t(x INT)".to_string())
-    .await
-    .unwrap();
+    // ### 修改记录 (2026-02-28)
+    // - 原因: 使用统一辅助函数
+    // - 目的: 简化初始化代码
+    let (_dir, raft_node) = setup_test_node().await;
 
     let router = check_program::raft::router::Router::new_local_leader_with_batch(
-        db_path.to_string_lossy().to_string(),
+        raft_node,
         check_program::raft::router::BatchConfig {
             max_batch_size: 100,
             max_delay_ms: 1000,
@@ -339,18 +359,14 @@ async fn batch_wait_timeout_returns_error() {
 
 #[tokio::test]
 async fn batch_size_threshold_flushes_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("node.db");
-    let sm = check_program::raft::state_machine::SqliteStateMachine::new(
-        db_path.to_string_lossy().to_string(),
-    )
-    .unwrap();
-    sm.apply_write("CREATE TABLE t(x INT)".to_string())
-        .await
-        .unwrap();
+    // ### 修改记录 (2026-02-28)
+    // - 原因: 使用统一辅助函数
+    // - 目的: 简化初始化代码
+    let (_dir, raft_node) = setup_test_node().await;
+    let sm = raft_node.state_machine.clone();
 
     let router = check_program::raft::router::Router::new_local_leader_with_batch(
-        db_path.to_string_lossy().to_string(),
+        raft_node,
         check_program::raft::router::BatchConfig {
             max_batch_size: 2,
             max_delay_ms: 10_000,
@@ -375,18 +391,14 @@ async fn batch_size_threshold_flushes_once() {
 
 #[tokio::test]
 async fn batch_timeout_cancels_and_skips_write() {
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("node.db");
-    let sm = check_program::raft::state_machine::SqliteStateMachine::new(
-        db_path.to_string_lossy().to_string(),
-    )
-    .unwrap();
-    sm.apply_write("CREATE TABLE t(x INT)".to_string())
-        .await
-        .unwrap();
+    // ### 修改记录 (2026-02-28)
+    // - 原因: 使用统一辅助函数
+    // - 目的: 简化初始化代码
+    let (_dir, raft_node) = setup_test_node().await;
+    let sm = raft_node.state_machine.clone();
 
     let router = check_program::raft::router::Router::new_local_leader_with_batch(
-        db_path.to_string_lossy().to_string(),
+        raft_node,
         check_program::raft::router::BatchConfig {
             max_batch_size: 10,
             max_delay_ms: 200,

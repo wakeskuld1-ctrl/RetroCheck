@@ -2,7 +2,14 @@
 //! - 原因: 需要持久化 Raft 元数据
 //! - 目的: 提供节点重启后的恢复能力
 
+// ### 修改记录 (2026-02-27)
+// - 原因: 需要测试辅助写入
+// - 目的: 提供简化入口
 use anyhow::Result;
+// ### 修改记录 (2026-02-27)
+// - 原因: 需要构造测试日志
+// - 目的: 为 append_for_test 提供类型
+use openraft::Entry;
 // ### 修改记录 (2026-02-26)
 // - 原因: 需要接入 OpenRaft 日志存储接口
 // - 目的: 实现 RaftLogStorage 与 RaftLogReader
@@ -10,9 +17,9 @@ use openraft::storage::{LogFlushed, LogState, RaftLogReader, RaftLogStorage};
 // ### 修改记录 (2026-02-26)
 // - 原因: 需要使用 Raft 核心类型
 // - 目的: 让存储与类型配置对齐
+use crate::raft::types::{NodeId, TypeConfig};
 use openraft::{AnyError, LogId, StorageError, StorageIOError, Vote};
 use std::ops::{Bound, RangeBounds};
-use crate::raft::types::{NodeId, TypeConfig};
 
 /// ### 修改记录 (2026-02-17)
 /// - 原因: 需要封装 sled 的存储句柄
@@ -113,6 +120,18 @@ impl RaftStore {
             Ok(0)
         }
     }
+
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 测试需要最小追加入口
+    /// - 目的: 避免依赖 LogFlushed 构造
+    pub async fn append_for_test(&mut self, entries: Vec<Entry<TypeConfig>>) -> Result<()> {
+        for entry in entries {
+            let key = Self::log_key(entry.log_id.index).to_vec();
+            let value = bincode::serialize(&entry)?;
+            self.log_tree.insert(key, value)?;
+        }
+        Ok(())
+    }
 }
 
 impl RaftStore {
@@ -177,14 +196,15 @@ impl RaftStore {
     // - 目的: 支持日志回收后恢复
     fn write_last_purged(&self, log_id: LogId<NodeId>) -> Result<()> {
         let bytes = bincode::serialize(&log_id)?;
-        self.meta_tree
-            .insert(Self::meta_key_last_purged(), bytes)?;
+        self.meta_tree.insert(Self::meta_key_last_purged(), bytes)?;
         Ok(())
     }
 }
 
 impl RaftLogReader<TypeConfig> for RaftStore {
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend>(
+    async fn try_get_log_entries<
+        RB: RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend,
+    >(
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<NodeId>> {
@@ -208,10 +228,8 @@ impl RaftLogStorage<TypeConfig> for RaftStore {
     type LogReader = RaftStore;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let last_purged_log_id = self
-            .read_last_purged()
-            .map_err(Self::to_read_error)?;
-        
+        let last_purged_log_id = self.read_last_purged().map_err(Self::to_read_error)?;
+
         let last_log_id = if let Some(item) = self.log_tree.iter().next_back() {
             let (_, value) = item.map_err(Self::to_read_error)?;
             let entry: openraft::Entry<TypeConfig> =
@@ -298,9 +316,7 @@ impl RaftLogStorage<TypeConfig> for RaftStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Self::to_read_error)?;
         for key in keys {
-            self.log_tree
-                .remove(key)
-                .map_err(Self::to_write_error)?;
+            self.log_tree.remove(key).map_err(Self::to_write_error)?;
         }
         Ok(())
     }
@@ -317,9 +333,7 @@ impl RaftLogStorage<TypeConfig> for RaftStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(Self::to_read_error)?;
         for key in keys {
-            self.log_tree
-                .remove(key)
-                .map_err(Self::to_write_error)?;
+            self.log_tree.remove(key).map_err(Self::to_write_error)?;
         }
         self.write_last_purged(log_id)
             .map_err(Self::to_write_error)?;

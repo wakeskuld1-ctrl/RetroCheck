@@ -3,6 +3,7 @@
 //! - 目的: 以测试驱动方式补齐 RaftNode 基础能力
 
 use check_program::raft::raft_node::RaftNode;
+use uuid::Uuid;
 
 /// ### 修改记录 (2026-02-17)
 /// - 原因: 需要确认单节点能完成自举
@@ -13,7 +14,7 @@ async fn raft_node_bootstrap_and_becomes_leader() {
     // - 原因: 需要最小化测试启动参数
     // - 目的: 聚焦验证节点能启动并进入 Leader 状态
     let node_id = 1u64;
-    let base_dir = std::env::temp_dir().join("raft_core_bootstrap");
+    let base_dir = std::env::temp_dir().join(format!("raft_core_bootstrap_{}", Uuid::new_v4()));
 
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要验证节点能自举
@@ -37,4 +38,3 @@ async fn raft_node_bootstrap_and_becomes_leader() {
         metrics = node.raft.metrics().borrow().clone();
     }
 }
-

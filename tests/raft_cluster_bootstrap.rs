@@ -23,7 +23,10 @@ async fn test_raft_cluster_bootstrap_and_elect_leader() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    assert!(leader_id.is_some(), "Leader should be elected within timeout");
+    assert!(
+        leader_id.is_some(),
+        "Leader should be elected within timeout"
+    );
     let leader_id = leader_id.unwrap();
     println!("Leader elected: {}", leader_id);
 
@@ -31,7 +34,12 @@ async fn test_raft_cluster_bootstrap_and_elect_leader() {
     for node in &cluster.nodes {
         if node.node_id() != leader_id {
             let metrics = node.raft.metrics().borrow().clone();
-            assert_eq!(metrics.state, ServerState::Follower, "Node {} should be follower", node.node_id());
+            assert_eq!(
+                metrics.state,
+                ServerState::Follower,
+                "Node {} should be follower",
+                node.node_id()
+            );
         }
     }
 
@@ -39,10 +47,13 @@ async fn test_raft_cluster_bootstrap_and_elect_leader() {
     // We can't easily write yet because client_write is not fully exposed/tested in TestCluster
     // But we can check if leader has committed initial membership
     // The leader should have committed at least one log entry (initial membership)
-    
+
     let leader_node = cluster.get_node(leader_id).unwrap();
     let metrics = leader_node.raft.metrics().borrow().clone();
-    assert!(metrics.last_log_index.unwrap_or(0) >= 1, "Leader should have committed at least one log");
+    assert!(
+        metrics.last_log_index.unwrap_or(0) >= 1,
+        "Leader should have committed at least one log"
+    );
 
     // 5. Cleanup (optional, temp dirs are used)
 }

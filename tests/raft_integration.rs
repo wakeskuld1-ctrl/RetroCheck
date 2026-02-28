@@ -34,7 +34,7 @@ async fn test_raft_cluster_integration() -> anyhow::Result<()> {
     println!("Initializing cluster with Node 1...");
     let mut nodes = BTreeMap::new();
     nodes.insert(1, BasicNode::new("127.0.0.1:9001"));
-    
+
     node1.raft.initialize(nodes).await?;
 
     // Wait for Node 1 to become leader
@@ -43,8 +43,14 @@ async fn test_raft_cluster_integration() -> anyhow::Result<()> {
 
     // 6. Add Node 2 and Node 3 as Learners
     println!("Adding learners...");
-    node1.raft.add_learner(2, BasicNode::new("127.0.0.1:9002"), true).await?;
-    node1.raft.add_learner(3, BasicNode::new("127.0.0.1:9003"), true).await?;
+    node1
+        .raft
+        .add_learner(2, BasicNode::new("127.0.0.1:9002"), true)
+        .await?;
+    node1
+        .raft
+        .add_learner(3, BasicNode::new("127.0.0.1:9003"), true)
+        .await?;
 
     // 7. Change Membership to [1, 2, 3]
     println!("Changing membership to [1, 2, 3]...");
@@ -96,9 +102,12 @@ async fn test_raft_cluster_integration() -> anyhow::Result<()> {
 
     // Wait for snapshot
     tokio::time::sleep(Duration::from_secs(2)).await;
-    
+
     // Check snapshot status
-    let snapshot_meta = node1.raft.metrics().borrow().snapshot.clone();
+    // ### 修改记录 (2026-02-27)
+    // - 原因: snapshot 是 Copy
+    // - 目的: 消除 clippy clone_on_copy
+    let snapshot_meta = node1.raft.metrics().borrow().snapshot;
     println!("Node 1 Snapshot: {:?}", snapshot_meta);
     assert!(snapshot_meta.is_some());
 
@@ -146,12 +155,17 @@ async fn test_raft_cluster_integration() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let metrics2_new = node2_restarted.raft.metrics().borrow().clone();
-    println!("Node 2 (Restarted) Last Log: {:?}", metrics2_new.last_log_index);
+    println!(
+        "Node 2 (Restarted) Last Log: {:?}",
+        metrics2_new.last_log_index
+    );
     println!("Node 2 (Restarted) Snapshot: {:?}", metrics2_new.snapshot);
 
     // Verify data via SQL query on Node 2
     // We expect 20 rows (0..20)
-    let count_res = node2_restarted.query_scalar("SELECT count(*) FROM test".to_string()).await?;
+    let count_res = node2_restarted
+        .query_scalar("SELECT count(*) FROM test".to_string())
+        .await?;
     println!("Node 2 Row Count: {}", count_res);
     assert_eq!(count_res, "20");
 
@@ -162,10 +176,13 @@ async fn test_raft_cluster_integration() -> anyhow::Result<()> {
 async fn wait_for_leader(raft: &Raft<TypeConfig>, target_node: NodeId) -> anyhow::Result<()> {
     for _ in 0..20 {
         let metrics = raft.metrics().borrow().clone();
-        if let Some(leader) = metrics.current_leader {
-            if leader == target_node {
-                return Ok(());
-            }
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 避免可折叠 if
+        // - 目的: 消除 clippy collapsible_if
+        if let Some(leader) = metrics.current_leader
+            && leader == target_node
+        {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

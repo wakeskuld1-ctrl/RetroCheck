@@ -17,6 +17,22 @@ async fn router_write_uses_raft_log() {
     let base_dir = std::env::temp_dir().join(format!("router_raft_write_{}", Uuid::new_v4()));
     let raft_node = RaftNode::start_for_test(1, base_dir).await.unwrap();
 
+    // ### 修改记录 (2026-02-28)
+    // - 原因: 需要初始化 Raft 集群
+    // - 目的: 确保节点能处理写请求
+    let mut members = std::collections::BTreeSet::new();
+    members.insert(1);
+    raft_node.raft.initialize(members).await.unwrap();
+    
+    // 等待成为 Leader
+    loop {
+        let metrics = raft_node.raft.metrics().borrow().clone();
+        if metrics.state == openraft::ServerState::Leader {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要 Router 绑定 RaftNode
     // - 目的: 让写入走统一 Raft 写路径

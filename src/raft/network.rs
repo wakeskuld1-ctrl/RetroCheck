@@ -2,7 +2,14 @@
 //! - 原因: 需要最小网络适配用于测试
 //! - 目的: 先验证复制路径，再逐步替换为 OpenRaft 网络层
 
+// ### 修改记录 (2026-02-27)
+// - 原因: 需要测试网络的节点类型
+// - 目的: 支持 TestNetwork 直接持有节点
+use crate::raft::raft_node::RaftNode;
 use crate::raft::types::{NodeId, TypeConfig};
+// ### 修改记录 (2026-02-27)
+// - 原因: 需要构造测试错误
+// - 目的: 报告节点缺失
 use anyhow::Result;
 use async_trait::async_trait;
 use openraft::error::{Fatal, InstallSnapshotError, RPCError, RaftError, RemoteError};
@@ -34,8 +41,6 @@ pub trait RaftNetworkTarget: Send + Sync {
     ) -> Result<VoteResponse<NodeId>, RaftError<NodeId>>;
 }
 
-
-
 /// ### 修改记录 (2026-02-26)
 /// - 原因: 需要一个内存中的路由器
 /// - 目的: 模拟网络传输，查找目标节点
@@ -60,16 +65,24 @@ impl RaftRouter {
         &self,
         target: NodeId,
         req: AppendEntriesRequest<TypeConfig>,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>> {
+    ) -> Result<
+        AppendEntriesResponse<NodeId>,
+        RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>,
+    > {
         let target_node = {
             let targets = self.targets.lock().unwrap();
             targets.get(&target).cloned()
         };
 
         if let Some(t) = target_node {
-            t.append_entries(req).await.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+            t.append_entries(req)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
         } else {
-             Err(RPCError::RemoteError(RemoteError::new(target, RaftError::Fatal(Fatal::Panicked))))
+            Err(RPCError::RemoteError(RemoteError::new(
+                target,
+                RaftError::Fatal(Fatal::Panicked),
+            )))
         }
     }
 
@@ -79,7 +92,11 @@ impl RaftRouter {
         req: InstallSnapshotRequest<TypeConfig>,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId, InstallSnapshotError>>,
+        RPCError<
+            NodeId,
+            <TypeConfig as openraft::RaftTypeConfig>::Node,
+            RaftError<NodeId, InstallSnapshotError>,
+        >,
     > {
         let target_node = {
             let targets = self.targets.lock().unwrap();
@@ -87,9 +104,14 @@ impl RaftRouter {
         };
 
         if let Some(t) = target_node {
-            t.install_snapshot(req).await.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+            t.install_snapshot(req)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
         } else {
-            Err(RPCError::RemoteError(RemoteError::new(target, RaftError::Fatal(Fatal::Panicked))))
+            Err(RPCError::RemoteError(RemoteError::new(
+                target,
+                RaftError::Fatal(Fatal::Panicked),
+            )))
         }
     }
 
@@ -97,16 +119,24 @@ impl RaftRouter {
         &self,
         target: NodeId,
         req: VoteRequest<NodeId>,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>> {
+    ) -> Result<
+        VoteResponse<NodeId>,
+        RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>,
+    > {
         let target_node = {
             let targets = self.targets.lock().unwrap();
             targets.get(&target).cloned()
         };
 
         if let Some(t) = target_node {
-            t.vote(req).await.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+            t.vote(req)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
         } else {
-            Err(RPCError::RemoteError(RemoteError::new(target, RaftError::Fatal(Fatal::Panicked))))
+            Err(RPCError::RemoteError(RemoteError::new(
+                target,
+                RaftError::Fatal(Fatal::Panicked),
+            )))
         }
     }
 }
@@ -174,3 +204,58 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkFactoryImpl {
     }
 }
 
+/// ### 修改记录 (2026-02-27)
+/// - 原因: 需要简化测试复制入口
+/// - 目的: 提供最小可用的测试网络
+#[derive(Clone)]
+pub struct TestNetwork {
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要保存节点集合
+    /// - 目的: 让测试直接访问目标节点
+    nodes: Arc<Mutex<HashMap<NodeId, RaftNode>>>,
+}
+
+impl TestNetwork {
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要初始化测试网络
+    /// - 目的: 提供空节点集合
+    pub fn new() -> Self {
+        Self {
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要注册节点
+    /// - 目的: 允许测试选择目标节点
+    pub fn register_node(&self, node: RaftNode) {
+        let mut nodes = self.nodes.lock().unwrap();
+        nodes.insert(node.node_id(), node);
+    }
+
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要模拟复制写入
+    /// - 目的: 让 follower 应用 SQL
+    pub async fn replicate_sql_for_test(&self, target: NodeId, sql: String) -> Result<usize> {
+        let node = {
+            let nodes = self.nodes.lock().unwrap();
+            nodes.get(&target).cloned()
+        };
+        let node = node.ok_or_else(|| anyhow::anyhow!("Target node not found"))?;
+        node.apply_sql_for_test(sql).await
+    }
+
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要读取节点
+    /// - 目的: 用于测试查询
+    pub fn get_node_for_test(&self, node_id: NodeId) -> Option<RaftNode> {
+        let nodes = self.nodes.lock().unwrap();
+        nodes.get(&node_id).cloned()
+    }
+}
+
+impl Default for TestNetwork {
+    fn default() -> Self {
+        Self::new()
+    }
+}

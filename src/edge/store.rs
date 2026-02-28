@@ -57,6 +57,10 @@ const HWM_KEY: &str = "edge_hwm";
 /// - 原因: 需要 cmd 命名空间前缀
 /// - 目的: 前缀扫描覆盖指令数据
 const CMD_PREFIX: &[u8] = b"cmd:";
+/// ### 修改记录 (2026-02-28)
+/// - 原因: 需要 ACK 命名空间前缀
+/// - 目的: 指令确认结果可落盘
+const ACK_PREFIX: &[u8] = b"ack:";
 /// ### 修改记录 (2026-02-26)
 /// - 原因: 需要持久化槽位计数
 /// - 目的: 支撑清理阈值判断
@@ -86,6 +90,50 @@ pub struct EdgeStore {
     /// - 原因: 需要记录最近一次清理耗时
     /// - 目的: 供性能测试断言
     last_cleanup_ms: AtomicU64,
+}
+
+/// ### 修改记录 (2026-02-27)
+/// - 原因: 需要暴露 cmd 信封信息
+/// - 目的: 支撑过期策略判断
+pub struct CmdEnvelope {
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要记录过期时间
+    /// - 目的: 供策略判定是否过期
+    pub expire_at_ms: u64,
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要记录 payload
+    /// - 目的: 供执行器处理
+    pub payload: Vec<u8>,
+}
+
+/// ### 修改记录 (2026-02-28)
+/// - 原因: 需要 ACK 状态枚举
+/// - 目的: 区分执行与丢弃结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckStatus {
+    /// ### 修改记录 (2026-02-28)
+    /// - 原因: 需要执行状态
+    /// - 目的: 标识已执行
+    Executed,
+    /// ### 修改记录 (2026-02-28)
+    /// - 原因: 需要丢弃状态
+    /// - 目的: 标识已丢弃
+    Dropped,
+}
+
+/// ### 修改记录 (2026-02-28)
+/// - 原因: 需要 ACK 记录结构
+/// - 目的: 持久化确认结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckRecord {
+    /// ### 修改记录 (2026-02-28)
+    /// - 原因: 需要状态字段
+    /// - 目的: 标识执行或丢弃
+    pub status: AckStatus,
+    /// ### 修改记录 (2026-02-28)
+    /// - 原因: 需要执行序号
+    /// - 目的: 支撑对账与回放
+    pub exec_seq: u64,
 }
 
 // ### 修改记录 (2026-02-26)
@@ -140,6 +188,16 @@ impl EdgeStore {
             // - 目的: 让测试可判断是否已记录
             last_cleanup_ms: AtomicU64::new(0),
         })
+    }
+
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要读取配置
+    /// - 目的: 供运行器获取默认超时
+    pub fn config(&self) -> &EdgeConfig {
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 需要暴露配置引用
+        // - 目的: 避免复制
+        &self.config
     }
 
     /// ### 修改记录 (2026-02-26)
@@ -614,18 +672,18 @@ impl EdgeStore {
         Ok(result)
     }
 
-    /// ### 修改记录 (2026-02-25)
-    /// - 原因: 需要读取 cmd payload
-    /// - 目的: 支撑过期/坏包丢弃
-    pub fn get_cmd_payload(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // ### 修改记录 (2026-02-25)
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要读取 cmd 信封
+    /// - 目的: 由策略判断是否过期
+    pub fn get_cmd_envelope(&self, key: &[u8]) -> Result<Option<CmdEnvelope>> {
+        // ### 修改记录 (2026-02-27)
         // - 原因: 可能不存在
         // - 目的: 简化调用方逻辑
         let raw = match self.db.get(key)? {
             Some(value) => value,
             None => return Ok(None),
         };
-        // ### 修改记录 (2026-02-25)
+        // ### 修改记录 (2026-02-27)
         // - 原因: 需要校验长度
         // - 目的: 保护坏包
         if raw.len() < 8 {
@@ -633,21 +691,58 @@ impl EdgeStore {
             self.db.flush()?;
             return Ok(None);
         }
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 需要解析过期时间
+        // - 目的: 提供给策略判断
         let mut ts_bytes = [0u8; 8];
         ts_bytes.copy_from_slice(&raw[0..8]);
         let expire_at_ms = u64::from_be_bytes(ts_bytes);
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 需要返回 payload
+        // - 目的: 供执行器使用
+        Ok(Some(CmdEnvelope {
+            expire_at_ms,
+            payload: raw[8..].to_vec(),
+        }))
+    }
+
+    /// ### 修改记录 (2026-02-25)
+    /// - 原因: 需要读取 cmd payload
+    /// - 目的: 支撑过期/坏包丢弃
+    pub fn get_cmd_payload(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 需要复用信封读取
+        // - 目的: 避免重复解析逻辑
+        let envelope = match self.get_cmd_envelope(key)? {
+            Some(envelope) => envelope,
+            None => return Ok(None),
+        };
         // ### 修改记录 (2026-02-25)
         // - 原因: 需要判断过期
         // - 目的: 过期直接丢弃
-        if expire_at_ms <= Self::now_ms() {
-            self.db.remove(key)?;
-            self.db.flush()?;
+        if envelope.expire_at_ms <= Self::now_ms() {
+            self.remove_cmd(key)?;
             return Ok(None);
         }
         // ### 修改记录 (2026-02-25)
         // - 原因: 需要返回 payload
         // - 目的: 跳过 TTL 头部
-        Ok(Some(raw[8..].to_vec()))
+        Ok(Some(envelope.payload))
+    }
+
+    /// ### 修改记录 (2026-02-27)
+    /// - 原因: 需要删除过期 cmd
+    /// - 目的: 避免重复处理与积压
+    pub fn remove_cmd(&self, key: &[u8]) -> Result<()> {
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 需要删除 cmd 键
+        // - 目的: 释放过期数据
+        self.db.remove(key)?;
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 需要尽快落盘
+        // - 目的: 避免断电复活
+        self.db.flush()?;
+        Ok(())
     }
 
     /// ### 修改记录 (2026-02-25)
@@ -673,6 +768,139 @@ impl EdgeStore {
         // - 原因: 读取持久化值
         // - 目的: 断电恢复可取回
         Ok(self.db.get(CMD_LAST_KEY)?.map(|v| v.to_vec()))
+    }
+
+    /// ### 修改记录 (2026-02-28)
+    /// - 原因: 需要从 cmd 键派生 ACK 键
+    /// - 目的: 保持 A/B 槽位隔离一致
+    fn ack_key_from_cmd_key(&self, cmd_key: &[u8]) -> Option<(u8, Vec<u8>)> {
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要匹配 slot0 前缀
+        // - 目的: 识别槽位并复用尾部
+        let slot0_prefix = self.prefixed_namespace(0, CMD_PREFIX);
+        if cmd_key.starts_with(slot0_prefix.as_slice()) {
+            // ### 修改记录 (2026-02-28)
+            // - 原因: 需要截取尾部
+            // - 目的: 复用 ts/seq 排序
+            let tail = &cmd_key[slot0_prefix.len()..];
+            // ### 修改记录 (2026-02-28)
+            // - 原因: 需要拼接 ACK 前缀
+            // - 目的: 生成目标 ACK 键
+            let ack_key = self.prefixed_key(0, ACK_PREFIX, tail);
+            return Some((0, ack_key));
+        }
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要匹配 slot1 前缀
+        // - 目的: 识别槽位并复用尾部
+        let slot1_prefix = self.prefixed_namespace(1, CMD_PREFIX);
+        if cmd_key.starts_with(slot1_prefix.as_slice()) {
+            // ### 修改记录 (2026-02-28)
+            // - 原因: 需要截取尾部
+            // - 目的: 复用 ts/seq 排序
+            let tail = &cmd_key[slot1_prefix.len()..];
+            // ### 修改记录 (2026-02-28)
+            // - 原因: 需要拼接 ACK 前缀
+            // - 目的: 生成目标 ACK 键
+            let ack_key = self.prefixed_key(1, ACK_PREFIX, tail);
+            return Some((1, ack_key));
+        }
+        None
+    }
+
+    /// ### 修改记录 (2026-02-28)
+    /// - 原因: 需要持久化 ACK 结果
+    /// - 目的: 指令闭环可对账
+    pub fn put_cmd_ack(&self, cmd_key: &[u8], record: AckRecord) -> Result<()> {
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要从 cmd 键派生 ACK 键
+        // - 目的: 与 cmd 同槽位持久化
+        let (slot, ack_key) = match self.ack_key_from_cmd_key(cmd_key) {
+            Some(value) => value,
+            None => return Err(anyhow::anyhow!("invalid cmd key for ack")),
+        };
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要编码状态
+        // - 目的: 便于反序列化
+        let status_byte = match record.status {
+            AckStatus::Executed => 1,
+            AckStatus::Dropped => 2,
+        };
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要写入 ACK 数据
+        // - 目的: 固化执行结果
+        let mut value = Vec::with_capacity(9);
+        value.push(status_byte);
+        value.extend_from_slice(&record.exec_seq.to_be_bytes());
+        // ### 修改记录 (2026-02-28)
+        // - 原因: sled 需要 IVec
+        // - 目的: 持久化 ACK 内容
+        self.db.insert(ack_key, value)?;
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要尽快落盘
+        // - 目的: 断电后仍可读取 ACK
+        self.db.flush()?;
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要遵循活跃槽位计数
+        // - 目的: 避免误触发清理
+        let active_slot = self.get_active_slot()?;
+        if slot == active_slot {
+            // ### 修改记录 (2026-02-28)
+            // - 原因: 需要更新槽位写入计数
+            // - 目的: 判断是否达到清理阈值
+            let active_count = self.increment_slot_count(active_slot)?;
+            // ### 修改记录 (2026-02-28)
+            // - 原因: 需要可能触发清理
+            // - 目的: 达到阈值时清理旧槽
+            self.maybe_cleanup_other_slot(active_slot, active_count)?;
+        }
+        Ok(())
+    }
+
+    /// ### 修改记录 (2026-02-28)
+    /// - 原因: 需要读取 ACK 结果
+    /// - 目的: 提供执行对账依据
+    pub fn get_cmd_ack(&self, cmd_key: &[u8]) -> Result<Option<AckRecord>> {
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要从 cmd 键派生 ACK 键
+        // - 目的: 复用命名空间规则
+        let (_slot, ack_key) = match self.ack_key_from_cmd_key(cmd_key) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 可能不存在
+        // - 目的: 简化调用方逻辑
+        let raw = match self.db.get(ack_key.as_slice())? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要校验长度
+        // - 目的: 保护坏包
+        if raw.len() < 9 {
+            self.db.remove(ack_key.as_slice())?;
+            self.db.flush()?;
+            return Ok(None);
+        }
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要解析状态
+        // - 目的: 还原执行结果
+        let status = match raw[0] {
+            1 => AckStatus::Executed,
+            2 => AckStatus::Dropped,
+            _ => {
+                self.db.remove(ack_key.as_slice())?;
+                self.db.flush()?;
+                return Ok(None);
+            }
+        };
+        // ### 修改记录 (2026-02-28)
+        // - 原因: 需要解析执行序号
+        // - 目的: 供对账/回放使用
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&raw[1..9]);
+        let exec_seq = u64::from_be_bytes(buf);
+        Ok(Some(AckRecord { status, exec_seq }))
     }
 
     /// ### 修改记录 (2026-02-25)

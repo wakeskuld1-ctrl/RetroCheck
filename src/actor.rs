@@ -486,15 +486,13 @@ impl DbActor {
                     // - 目的: 避免读取 TEXT 时失败
                     let value_res = stmt.query_row([], |row| row.get(0));
                     match value_res {
-                        Ok(value) => {
-                             match value {
-                                rusqlite::types::Value::Null => Ok(String::new()),
-                                rusqlite::types::Value::Integer(v) => Ok(v.to_string()),
-                                rusqlite::types::Value::Real(v) => Ok(v.to_string()),
-                                rusqlite::types::Value::Text(v) => Ok(v),
-                                rusqlite::types::Value::Blob(v) => {
-                                    Ok(String::from_utf8_lossy(&v).to_string())
-                                }
+                        Ok(value) => match value {
+                            rusqlite::types::Value::Null => Ok(String::new()),
+                            rusqlite::types::Value::Integer(v) => Ok(v.to_string()),
+                            rusqlite::types::Value::Real(v) => Ok(v.to_string()),
+                            rusqlite::types::Value::Text(v) => Ok(v),
+                            rusqlite::types::Value::Blob(v) => {
+                                Ok(String::from_utf8_lossy(&v).to_string())
                             }
                         },
                         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
@@ -529,33 +527,37 @@ impl DbActor {
                 // - 原因: VACUUM INTO 要求目标文件不存在或为空
                 // - 目的: 确保快照生成不报错
                 let _ = std::fs::remove_file(&path);
-                
+
                 let sql = format!("VACUUM INTO '{}'", path);
                 // Note: VACUUM INTO handles locking and consistency internally
                 let res = self.conn.execute(&sql, []);
                 let _ = resp.send(res.map(|_| ()).map_err(|e| anyhow!(e)));
             }
-            DbMessage::InstallSnapshot { path: snapshot_path, resp } => {
+            DbMessage::InstallSnapshot {
+                path: snapshot_path,
+                resp,
+            } => {
                 // ### 修改记录 (2026-02-26)
                 // - 原因: 实现快照安装逻辑
                 // - 目的: 替换数据库文件并重置连接
-                
+
                 // 1. 获取当前数据库路径
                 let current_path_opt = self.conn.path().map(|p| p.to_string());
-                
+
                 if let Some(current_path) = current_path_opt {
                     // 2. 准备替换连接
                     // 使用内存数据库临时占位，以便取出 self.conn 进行关闭
                     let dummy_conn = match Connection::open_in_memory() {
                         Ok(c) => c,
                         Err(e) => {
-                            let _ = resp.send(Err(anyhow!("Failed to open dummy connection: {}", e)));
+                            let _ =
+                                resp.send(Err(anyhow!("Failed to open dummy connection: {}", e)));
                             return;
                         }
                     };
-                    
+
                     let old_conn = std::mem::replace(&mut self.conn, dummy_conn);
-                    
+
                     // 3. 关闭旧连接
                     match old_conn.close() {
                         Ok(_) => {
@@ -566,10 +568,10 @@ impl DbActor {
                             // 但如果 remove 成功 rename 失败，数据就丢了。
                             // 风险提示：生产环境应有 .bak 备份机制。
                             // 这里简化：直接 rename (Rust std::fs::rename on Windows supports overwriting if not locked)
-                            
+
                             // 必须确保没有其他进程（如 WAL checkpoint）锁住文件
                             // close() 应该已经释放了锁。
-                            
+
                             if let Err(e) = std::fs::rename(&snapshot_path, &current_path) {
                                 // 尝试恢复
                                 if let Ok(reopened) = Connection::open(&current_path) {
@@ -578,13 +580,13 @@ impl DbActor {
                                 let _ = resp.send(Err(anyhow!("Failed to replace DB file: {}", e)));
                                 return;
                             }
-                            
+
                             // 5. 重新打开连接
                             match Connection::open(&current_path) {
                                 Ok(new_conn) => {
                                     self.conn = new_conn;
                                     // 重新初始化 WAL 等设置（如果需要）
-                                    // 这里假设默认设置即可，或者应该调用 init_meta? 
+                                    // 这里假设默认设置即可，或者应该调用 init_meta?
                                     // 快照应该包含了 meta 表。
                                     let _ = resp.send(Ok(()));
                                 }

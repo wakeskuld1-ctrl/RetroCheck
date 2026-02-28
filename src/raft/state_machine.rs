@@ -7,7 +7,9 @@ use crate::config::NodeRole;
 use crate::raft::types::{NodeId, Request, Response, TypeConfig};
 use anyhow::Result;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-use openraft::{EntryPayload, LogId, Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership};
+use openraft::{
+    EntryPayload, LogId, Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
+};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -97,16 +99,14 @@ impl SqliteStateMachine {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let last_applied_log_id = self
             .get_meta::<LogId<NodeId>>("last_applied")
             .await
             .map_err(|e| StorageError::IO {
                 source: StorageIOError::read(openraft::AnyError::error(e.to_string())),
             })?;
-        
+
         let last_membership = self
             .get_meta::<StoredMembership<NodeId, openraft::BasicNode>>("last_membership")
             .await
@@ -115,21 +115,36 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
             })?;
 
         if let (Some(last_log_id), Some(membership)) = (last_applied_log_id, last_membership) {
-            let snapshot_id = format!("{}-{}-{}", last_log_id.leader_id.term, last_log_id.index, Uuid::new_v4());
-            let snapshot_path = std::path::Path::new(&self.root_dir).join(format!("snapshot-{}.db", snapshot_id));
+            let snapshot_id = format!(
+                "{}-{}-{}",
+                last_log_id.leader_id.term,
+                last_log_id.index,
+                Uuid::new_v4()
+            );
+            let snapshot_path =
+                std::path::Path::new(&self.root_dir).join(format!("snapshot-{}.db", snapshot_id));
             let snapshot_path_str = snapshot_path.to_string_lossy().to_string();
 
             // 1. Create snapshot via VACUUM INTO
-            self.handle.create_snapshot(snapshot_path_str.clone())
+            self.handle
+                .create_snapshot(snapshot_path_str.clone())
                 .await
                 .map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_snapshot(None, openraft::AnyError::error(e.to_string())),
+                    source: StorageIOError::write_snapshot(
+                        None,
+                        openraft::AnyError::error(e.to_string()),
+                    ),
                 })?;
 
             // 2. Read snapshot content
-            let data = tokio::fs::read(&snapshot_path).await.map_err(|e| StorageError::IO {
-                source: StorageIOError::read_snapshot(None, openraft::AnyError::error(e.to_string())),
-            })?;
+            let data = tokio::fs::read(&snapshot_path)
+                .await
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::read_snapshot(
+                        None,
+                        openraft::AnyError::error(e.to_string()),
+                    ),
+                })?;
 
             // 3. Clean up temporary file
             let _ = tokio::fs::remove_file(&snapshot_path).await;
@@ -145,7 +160,7 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteStateMachine {
                 snapshot: Box::new(std::io::Cursor::new(data)),
             })
         } else {
-             Err(StorageError::IO {
+            Err(StorageError::IO {
                 source: StorageIOError::read(openraft::AnyError::error("No state to snapshot")),
             })
         }
@@ -157,22 +172,31 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, openraft::BasicNode>), StorageError<NodeId>> {
+    ) -> Result<
+        (
+            Option<LogId<NodeId>>,
+            StoredMembership<NodeId, openraft::BasicNode>,
+        ),
+        StorageError<NodeId>,
+    > {
         let last_applied = self
             .get_meta::<LogId<NodeId>>("last_applied")
             .await
             .map_err(|e| StorageError::IO {
                 source: StorageIOError::read(openraft::AnyError::error(e.to_string())),
             })?;
-        
+
         let last_membership = self
             .get_meta::<StoredMembership<NodeId, openraft::BasicNode>>("last_membership")
             .await
             .map_err(|e| StorageError::IO {
                 source: StorageIOError::read(openraft::AnyError::error(e.to_string())),
             })?;
-        
-        let effective_membership = last_membership.unwrap_or_else(|| StoredMembership::default());
+
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 修复 clippy redundant_closure
+        // - 目的: 保持语义并消除警告
+        let effective_membership = last_membership.unwrap_or_default();
 
         Ok((last_applied, effective_membership))
     }
@@ -186,14 +210,35 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         let mut entry_map = Vec::new();
         let mut last_log_id = None;
 
-        for (_i, entry) in entries.into_iter().enumerate() {
+        // ### 修改记录 (2026-02-27)
+        // - 原因: 修复 clippy unused_enumerate_index
+        // - 目的: 保持语义并消除警告
+        for entry in entries.into_iter() {
             last_log_id = Some(entry.log_id);
             match entry.payload {
                 EntryPayload::Normal(req) => {
                     match req {
                         Request::Write { sql } => {
                             sqls.push(sql);
-                            entry_map.push(Some(sqls.len() - 1)); // Map to the current SQL index
+                            // ### 修改记录 (2026-02-28)
+                            // - 原因: 统一 entry_map 为 Range 格式
+                            // - 目的: 让后续处理逻辑一致
+                            entry_map.push(Some((sqls.len() - 1, sqls.len())));
+                        }
+                        // ### 修改记录 (2026-02-28)
+                        // - 原因: 增加对 WriteBatch 的支持
+                        // - 目的: 将批次请求拆解为多条 SQL 并映射结果
+                        Request::WriteBatch { sqls: batch_sqls } => {
+                            let start_idx = sqls.len();
+                            sqls.extend(batch_sqls);
+                            let end_idx = sqls.len();
+                            // 批次请求的响应通常是最后一条的结果或聚合结果
+                            // 这里我们约定返回受影响行数的总和
+                            // 但由于 entry_map 是一对一映射 Response
+                            // 我们需要定义 WriteBatch 的 Response 语义
+                            // 暂时将整个批次视为产生一个 Response
+                            // 值为所有受影响行数的逗号分隔字符串
+                            entry_map.push(Some((start_idx, end_idx))); 
                         }
                         Request::Read { sql: _ } => {
                             // Read requests in log are ignored for state modification
@@ -202,13 +247,11 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                     }
                 }
                 EntryPayload::Membership(ref mem) => {
-                    let stored_mem = StoredMembership::new(
-                        Some(entry.log_id),
-                        mem.clone(),
-                    );
-                    let mem_json = serde_json::to_string(&stored_mem).map_err(|e| StorageError::IO {
-                         source: StorageIOError::write(openraft::AnyError::error(e.to_string())),
-                    })?;
+                    let stored_mem = StoredMembership::new(Some(entry.log_id), mem.clone());
+                    let mem_json =
+                        serde_json::to_string(&stored_mem).map_err(|e| StorageError::IO {
+                            source: StorageIOError::write(openraft::AnyError::error(e.to_string())),
+                        })?;
                     let sql = format!(
                         "INSERT INTO _raft_meta(key, value) VALUES ('last_membership', '{}')
                          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -238,12 +281,16 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         }
 
         if sqls.is_empty() {
-             return Ok(Vec::new());
+            return Ok(Vec::new());
         }
 
-        let results = self.handle.execute_batch(sqls).await.map_err(|e| StorageError::IO {
-            source: StorageIOError::write(openraft::AnyError::error(e.to_string())),
-        })?;
+        let results = self
+            .handle
+            .execute_batch(sqls)
+            .await
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::write(openraft::AnyError::error(e.to_string())),
+            })?;
 
         // Map results back to responses
         let mut responses = Vec::new();
@@ -254,29 +301,44 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         // So entry_map[k] = Some(idx) means the k-th entry corresponds to sqls[idx].
         // However, `execute_batch` returns results for ALL sqls.
         // So `results[idx]` is the result for `sqls[idx]`.
-        
+
         // One issue: `entry_map` indices need to be correct.
         // In the loop, I did `entry_map.push(Some(i))`? No.
         // I need to track the index in `sqls`.
-        
+
         // Let's correct the loop logic in the actual code below.
         // I will use `sqls.len()` to get current index.
-        
+
+        // ### 修改记录 (2026-02-28)
+        // - 原因: entry_map 存储的是 Range 而不仅仅是 Index
+        // - 目的: 兼容单条 SQL 与批量 SQL 的结果映射
         for item in entry_map {
-            if let Some(idx) = item {
-                if idx < results.len() {
-                    responses.push(Response {
-                        value: Some(results[idx].to_string()),
-                    });
-                } else {
-                    // Should not happen
+            match item {
+                Some((start, end)) => {
+                    // 如果是单条 SQL，end = start + 1
+                    // 如果是批量 SQL，end > start + 1
+                    // 我们需要聚合结果或者返回最后一条
+                    if end > start {
+                        // 聚合受影响行数
+                        let mut total_affected = 0;
+                        for i in start..end {
+                            if i < results.len() {
+                                total_affected += results[i];
+                            }
+                        }
+                        responses.push(Response {
+                            value: Some(total_affected.to_string()),
+                        });
+                    } else {
+                         responses.push(Response { value: None });
+                    }
+                }
+                None => {
                     responses.push(Response { value: None });
                 }
-            } else {
-                responses.push(Response { value: None });
             }
         }
-        
+
         Ok(responses)
     }
 
@@ -284,7 +346,9 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<NodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<NodeId>> {
         Ok(Box::new(std::io::Cursor::new(Vec::new())))
     }
 
@@ -294,24 +358,42 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
         snapshot: Box<std::io::Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let snapshot_id = Uuid::new_v4().to_string();
-        let snapshot_path = std::path::Path::new(&self.root_dir).join(format!("snapshot-{}.db", snapshot_id));
+        let snapshot_path =
+            std::path::Path::new(&self.root_dir).join(format!("snapshot-{}.db", snapshot_id));
         let snapshot_path_str = snapshot_path.to_string_lossy().to_string();
 
-        let mut file = tokio::fs::File::create(&snapshot_path).await.map_err(|e| StorageError::IO {
-            source: StorageIOError::write_snapshot(None, openraft::AnyError::error(e.to_string())),
-        })?;
-        
-        file.write_all(snapshot.get_ref()).await.map_err(|e| StorageError::IO {
-            source: StorageIOError::write_snapshot(None, openraft::AnyError::error(e.to_string())),
-        })?;
-        
+        let mut file =
+            tokio::fs::File::create(&snapshot_path)
+                .await
+                .map_err(|e| StorageError::IO {
+                    source: StorageIOError::write_snapshot(
+                        None,
+                        openraft::AnyError::error(e.to_string()),
+                    ),
+                })?;
+
+        file.write_all(snapshot.get_ref())
+            .await
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::write_snapshot(
+                    None,
+                    openraft::AnyError::error(e.to_string()),
+                ),
+            })?;
+
         file.sync_all().await.map_err(|e| StorageError::IO {
             source: StorageIOError::write_snapshot(None, openraft::AnyError::error(e.to_string())),
         })?;
 
-        self.handle.install_snapshot(snapshot_path_str.clone()).await.map_err(|e| StorageError::IO {
-            source: StorageIOError::write_snapshot(None, openraft::AnyError::error(e.to_string())),
-        })?;
+        self.handle
+            .install_snapshot(snapshot_path_str.clone())
+            .await
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::write_snapshot(
+                    None,
+                    openraft::AnyError::error(e.to_string()),
+                ),
+            })?;
 
         Ok(())
     }

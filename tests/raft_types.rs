@@ -1,7 +1,11 @@
 #[test]
 fn raft_type_config_is_constructible() {
-    let _req = check_program::raft::types::Request::Write { sql: "SELECT 1".to_string() };
-    let _resp = check_program::raft::types::Response { value: Some("ok".to_string()) };
+    let _req = check_program::raft::types::Request::Write {
+        sql: "SELECT 1".to_string(),
+    };
+    let _resp = check_program::raft::types::Response {
+        value: Some("ok".to_string()),
+    };
 }
 
 #[test]

@@ -110,9 +110,15 @@ impl DatabaseService for TestRouterService {
     // - 目的: 返回固定值即可
     async fn get_version(
         &self,
-        _request: Request<GetVersionRequest>,
+        request: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
-        Ok(Response::new(GetVersionResponse { version: 0 }))
+        let req = request.into_inner();
+        let version = self
+            .router
+            .get_version(req.table)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(GetVersionResponse { version }))
     }
 
     // ### 修改记录 (2026-02-25)
@@ -477,6 +483,43 @@ async fn router_forwards_write_to_leader_grpc() {
     assert_eq!(rows, 1);
 }
 
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 需要覆盖非 Leader 读转发
+/// - 目的: 防止读路径返回陈旧版本
+#[tokio::test]
+async fn router_forwards_get_version_to_leader_grpc() {
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要独立的 Leader 数据文件
+    // - 目的: 保持测试隔离与可重复
+    let temp_dir = TempDir::new().unwrap();
+    let leader_db = temp_dir.path().join("leader_version.db");
+    let leader_router = Router::new_local_leader(leader_db.to_string_lossy().to_string()).unwrap();
+    let leader_addr = spawn_test_server(Arc::new(leader_router)).await;
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 构造非 Leader 路由
+    // - 目的: 强制进入转发分支
+    let follower_router = Router::new_follower_with_leader_addr(leader_addr);
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要先建表以产生写序列
+    // - 目的: 保证版本号可递增
+    let _ = follower_router
+        .write("CREATE TABLE IF NOT EXISTS t(x INT)".to_string())
+        .await
+        .unwrap();
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 需要真实写入以更新版本
+    // - 目的: 验证版本号随写入推进
+    let _ = follower_router
+        .write("INSERT INTO t VALUES (1)".to_string())
+        .await
+        .unwrap();
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 读路径应走 Leader
+    // - 目的: 确保版本读取为最新
+    let version = follower_router.get_version("t".to_string()).await.unwrap();
+    assert!(version >= 2);
+}
+
 /// ### 修改记录 (2026-02-25)
 /// - 原因: 需要覆盖 leader 地址无效场景
 /// - 目的: 验证返回错误包含连接失败信息
@@ -623,13 +666,16 @@ async fn router_forward_timeout_repeats_when_timeout_too_short() {
 }
 
 /// ### 修改记录 (2026-02-25)
-/// - 原因: 需要验证敏感信息不外泄
-/// - 目的: 锁定错误脱敏行为
+/// - 原因: 需要验证错误信息可保留
+/// - 目的: 锁定错误透传行为
+/// ### 修改记录 (2026-02-26)
+/// - 原因: 审计建议保留 gRPC 错误细节
+/// - 目的: 防止错误被吞咽影响排障
 #[tokio::test]
-async fn router_forward_sanitizes_execute_error_message() {
+async fn router_forward_preserves_execute_error_message() {
     // ### 修改记录 (2026-02-25)
     // - 原因: 注入敏感字串
-    // - 目的: 确保错误中不出现敏感片段
+    // - 目的: 确保错误中保留原始片段
     let secret = "SECRET_TOKEN_123".to_string();
     let leader_addr = spawn_error_server(format!("db error: {}", secret)).await;
     let follower = Router::new_follower_with_leader_addr(leader_addr);
@@ -638,8 +684,8 @@ async fn router_forward_sanitizes_execute_error_message() {
         .await
         .unwrap_err();
     let msg = err.to_string();
-    // ### 修改记录 (2026-02-25)
-    // - 原因: 错误细节可能变化
-    // - 目的: 只断言固定前缀
-    assert!(msg.starts_with("Leader execute failed"));
+    // ### 修改记录 (2026-02-26)
+    // - 原因: 错误内容需要包含原始片段
+    // - 目的: 确认错误透传而非统一替换
+    assert!(msg.contains(&secret));
 }

@@ -40,6 +40,11 @@ pub struct EdgeConfig {
     // - 原因: 需要配置清理触发阈值
     // - 目的: 当活动槽位达到比例时清理旧槽
     pub ab_cleanup_ratio: f64,
+    // ### 修改记录 (2026-02-27)
+    // - 原因: 需要配置指令过期宽限期
+    // - 目的: 让过期确认窗口由配置控制
+    #[serde(default)]
+    pub cmd_timeout_ms: u64,
 }
 
 impl ClusterConfig {
@@ -63,6 +68,10 @@ impl Default for EdgeConfig {
             // - 原因: 默认阈值为 50%
             // - 目的: 与 A/B 设计约定一致
             ab_cleanup_ratio: 0.5,
+            // ### 修改记录 (2026-02-27)
+            // - 原因: 需要默认超时配置
+            // - 目的: 保持过期策略默认严格
+            cmd_timeout_ms: 0,
         }
     }
 }
