@@ -5,6 +5,9 @@ use check_program::pb::{
     GetVersionResponse, PrepareRequest, PrepareResponse, RollbackRequest, RollbackResponse,
 };
 use check_program::raft::router::Router;
+use check_program::hub::edge_gateway::EdgeGateway;
+use check_program::config::EdgeGatewayConfig;
+use std::path::Path;
 use clap::Parser;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, transport::Server};
@@ -35,6 +38,14 @@ struct Args {
     /// - sqlite: General-purpose OLTP storage.
     #[arg(short, long, default_value = "sqlite")]
     engine: String,
+
+    /// Path to edge gateway config file
+    #[arg(long)]
+    edge_config: Option<String>,
+
+    /// Port for Edge Gateway (TCP)
+    #[arg(long, default_value_t = 8080)]
+    edge_port: u16,
 }
 
 /// ### 修改记录 (2026-02-17)
@@ -63,6 +74,17 @@ impl WriteRouter for Router {
 
     async fn get_version(&self, table: String) -> anyhow::Result<i32> {
         self.get_version(table).await
+    }
+}
+
+#[async_trait]
+impl<R: WriteRouter + ?Sized> WriteRouter for Arc<R> {
+    async fn write(&self, sql: String) -> anyhow::Result<usize> {
+        (**self).write(sql).await
+    }
+
+    async fn get_version(&self, table: String) -> anyhow::Result<i32> {
+        (**self).get_version(table).await
     }
 }
 
@@ -267,20 +289,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要将写路径切换到 Router
     // - 目的: 保持协议不变的同时完成内部替换
-    let engine: Arc<dyn StorageEngine> = match args.engine.as_str() {
+    let (engine, router): (Arc<dyn StorageEngine>, Option<Arc<Router>>) = match args.engine.as_str() {
         "sqlite" => {
             // ### 修改记录 (2026-02-17)
             // - 原因: 需要引入 RaftNode 写路径
             // - 目的: 让 Router 写入走 RaftNode
             let raft_node =
                 RaftNode::start_local(1, std::path::PathBuf::from(args.db.clone())).await?;
-            let router = Router::new_with_raft(raft_node);
-            Arc::new(RouterEngine::new(router))
+            let router = Arc::new(Router::new_with_raft(raft_node));
+            (Arc::new(RouterEngine::new(router.clone())), Some(router))
         }
         _ => return Err(format!("Unknown engine: {}", args.engine).into()),
     };
 
     let service = DbServiceImpl::new(engine);
+
+    // Start Edge Gateway if configured
+    if let Some(router) = router {
+        if let Some(config_path) = args.edge_config {
+            let config = EdgeGatewayConfig::load_from_file(Path::new(&config_path))?;
+            let edge_addr = format!("0.0.0.0:{}", args.edge_port);
+            let gateway = EdgeGateway::new(edge_addr, router, config)?;
+            tokio::spawn(async move {
+                if let Err(e) = Arc::new(gateway).run().await {
+                    eprintln!("EdgeGateway error: {:?}", e);
+                }
+            });
+        }
+    }
 
     // Start serving requests
     Server::builder()

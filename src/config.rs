@@ -115,3 +115,40 @@ impl EdgeConfig {
         self
     }
 }
+
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要 EdgeGateway 统一配置
+// - 目的: 支持 TTL/Nonce/持久化开关配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeGatewayConfig {
+    pub session_ttl_ms: u64,
+    pub nonce_cache_limit: usize,
+    pub nonce_persist_enabled: bool,
+    pub nonce_persist_path: String,
+}
+
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要默认配置
+// - 目的: 保证无配置文件时可用
+impl Default for EdgeGatewayConfig {
+    fn default() -> Self {
+        Self {
+            session_ttl_ms: 60_000,
+            nonce_cache_limit: 1000,
+            nonce_persist_enabled: false,
+            nonce_persist_path: "edge_nonce_cache".to_string(),
+        }
+    }
+}
+
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要加载 EdgeGateway 配置
+// - 目的: 从 JSON 文件初始化网关
+impl EdgeGatewayConfig {
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let config: EdgeGatewayConfig = serde_json::from_reader(reader)?;
+        Ok(config)
+    }
+}
