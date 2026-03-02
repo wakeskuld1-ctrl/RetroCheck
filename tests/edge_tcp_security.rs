@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
-use check_program::hub::edge_gateway::{
-    MSG_TYPE_AUTH_HELLO, MSG_TYPE_RESPONSE, MSG_TYPE_SESSION_REQUEST,
-};
+use anyhow::{Result, anyhow};
 use check_program::hub::edge_schema::{decode_auth_ack, decode_signed_response};
-use tokio::time::{timeout, Duration};
+use check_program::hub::protocol::{
+    MSG_TYPE_AUTH_HELLO, MSG_TYPE_ERROR, MSG_TYPE_RESPONSE, MSG_TYPE_SESSION_REQUEST,
+};
+use serde_json::Value;
+use tokio::time::{Duration, timeout};
 
 mod edge_tcp_common;
 use edge_tcp_common::{
@@ -39,7 +40,8 @@ async fn edge_tcp_handshake_and_upload_roundtrip() -> Result<()> {
     })?;
     assert_eq!(signed.session_id, ack.session_id);
     assert_eq!(signed.nonce, 2);
-    assert_eq!(signed.payload, b"OK");
+    let response: Value = serde_json::from_slice(&signed.payload)?;
+    assert_eq!(response["success"], 1);
 
     handle.abort();
     Ok(())
@@ -63,7 +65,11 @@ async fn edge_tcp_tampered_payload_is_rejected() -> Result<()> {
 
     let read_result = timeout(Duration::from_millis(200), read_frame(&mut stream)).await;
     match read_result {
-        Ok(Ok(_)) => return Err(anyhow!("tampered payload unexpectedly accepted")),
+        Ok(Ok((h, _))) => {
+            if h.msg_type != MSG_TYPE_ERROR {
+                return Err(anyhow!("tampered payload unexpectedly accepted: {:?}", h));
+            }
+        }
         Ok(Err(_)) => {}
         Err(_) => {}
     }

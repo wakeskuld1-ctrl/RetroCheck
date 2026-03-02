@@ -278,16 +278,18 @@ impl TestCluster {
                 // - 目的: 避免在节点关闭后 panic (如果 watch channel 关闭)
                 // 增加更多的重试和状态检查
                 let metrics_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                     node.raft.metrics().borrow().clone()
+                    node.raft.metrics().borrow().clone()
                 }));
 
-                if let Ok(metrics) = metrics_result {
-                     if metrics.state == ServerState::Leader {
-                        // 额外检查: 确保不是在 Candidate 状态下被误判
-                        if metrics.current_leader.is_some() && metrics.current_leader.unwrap() == node.node_id() {
-                            return Ok(node.node_id());
-                        }
-                    }
+                // ### 修改记录 (2026-03-01)
+                // - 原因: clippy 提示可合并条件判断
+                // - 目的: 保持 leader 检测逻辑一致
+                if let Ok(metrics) = metrics_result
+                    && metrics.state == ServerState::Leader
+                    && matches!(metrics.current_leader, Some(id) if id == node.node_id())
+                {
+                    // 额外检查: 确保不是在 Candidate 状态下被误判
+                    return Ok(node.node_id());
                 }
             }
             // ### 修改记录 (2026-02-27)
@@ -295,38 +297,49 @@ impl TestCluster {
             // - 目的: 降低忙等压力
             sleep(Duration::from_millis(100)).await;
         }
-        
+
         // 尝试最后一次全面扫描，输出调试信息
         for node in &self.nodes {
-            if exclude == Some(node.node_id()) { continue; }
-            if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.raft.metrics().borrow().clone())) {
-                println!("Node {} state: {:?}, current_leader: {:?}", node.node_id(), metrics.state, metrics.current_leader);
-                
+            if exclude == Some(node.node_id()) {
+                continue;
+            }
+            if let Ok(metrics) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                node.raft.metrics().borrow().clone()
+            })) {
+                println!(
+                    "Node {} state: {:?}, current_leader: {:?}",
+                    node.node_id(),
+                    metrics.state,
+                    metrics.current_leader
+                );
+
                 // 尝试手动触发选举 (如果是 Candidate)
                 if metrics.state == ServerState::Candidate {
                     let _ = node.raft.trigger().elect().await;
                 }
             }
         }
-        
-        // 再试一次
-         sleep(Duration::from_millis(1000)).await;
-         for node in &self.nodes {
-                if exclude == Some(node.node_id()) {
-                    continue;
-                }
-                let metrics_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                     node.raft.metrics().borrow().clone()
-                }));
 
-                if let Ok(metrics) = metrics_result {
-                     if metrics.state == ServerState::Leader {
-                        if metrics.current_leader.is_some() && metrics.current_leader.unwrap() == node.node_id() {
-                            return Ok(node.node_id());
-                        }
-                    }
-                }
+        // 再试一次
+        sleep(Duration::from_millis(1000)).await;
+        for node in &self.nodes {
+            if exclude == Some(node.node_id()) {
+                continue;
             }
+            let metrics_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                node.raft.metrics().borrow().clone()
+            }));
+
+            // ### 修改记录 (2026-03-01)
+            // - 原因: clippy 提示可合并条件判断
+            // - 目的: 保持 leader 检测逻辑一致
+            if let Ok(metrics) = metrics_result
+                && metrics.state == ServerState::Leader
+                && matches!(metrics.current_leader, Some(id) if id == node.node_id())
+            {
+                return Ok(node.node_id());
+            }
+        }
 
         Err(anyhow!("Leader not found"))
     }
@@ -385,17 +398,17 @@ impl TestCluster {
         // - 目的: 定位待故障节点
         let leader_id = self.wait_for_leader(None).await?;
         self.stop_node(leader_id).await?;
-        
+
         // ### 修改记录 (2026-02-27)
         // - 原因: 需要等待新 leader
         // - 目的: 确保 failover 完成
         let _ = self.wait_for_leader(Some(leader_id)).await?;
-        
+
         // ### 修改记录 (2026-02-28)
         // - 原因: 需要恢复故障节点
         // - 目的: 避免节点耗尽，模拟真实故障恢复
         self.start_node(leader_id).await?;
-        
+
         Ok(())
     }
 

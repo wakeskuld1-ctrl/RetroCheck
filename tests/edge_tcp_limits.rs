@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
-use check_program::hub::edge_gateway::{
-    MAGIC, MSG_TYPE_AUTH_HELLO, MSG_TYPE_SESSION_REQUEST, VERSION,
-};
+use anyhow::{Result, anyhow};
 use check_program::hub::edge_schema::decode_auth_ack;
-use tokio::time::{timeout, Duration};
+use check_program::hub::protocol::{
+    MAGIC, MSG_TYPE_AUTH_HELLO, MSG_TYPE_ERROR, MSG_TYPE_SESSION_REQUEST, VERSION,
+};
+use tokio::time::{Duration, timeout};
 
 mod edge_tcp_common;
 use edge_tcp_common::{
@@ -36,7 +36,7 @@ async fn edge_tcp_rejects_replay_after_restart_when_nonce_persisted() -> Result<
     let config_path = dir.path().join("edge_gateway_config_persist.json");
     let persist_path = dir.path().join("nonce_cache");
     let persist_path_str = persist_path.to_str().unwrap().replace("\\", "/");
-    
+
     std::fs::write(
         &config_path,
         format!(
@@ -44,7 +44,7 @@ async fn edge_tcp_rejects_replay_after_restart_when_nonce_persisted() -> Result<
             persist_path_str
         ),
     )?;
-    
+
     let (addr, handle) = spawn_gateway_with_config(&config_path).await?;
     let mut stream = connect_with_retry(&addr).await?;
     let auth_payload = build_auth_hello(9, 1000, 7);
@@ -61,7 +61,7 @@ async fn edge_tcp_rejects_replay_after_restart_when_nonce_persisted() -> Result<
     let mut stream = connect_with_retry(&addr).await?;
     // Replay same nonce
     send_frame(&mut stream, MSG_TYPE_AUTH_HELLO, 2, &auth_payload).await?;
-    
+
     // Expect failure (connection close or error response)
     // Actually, currently it might just close connection on error in handle_auth_hello if unwrap fails?
     // No, handle_auth_hello returns Result, handle_connection logs error.
@@ -69,19 +69,20 @@ async fn edge_tcp_rejects_replay_after_restart_when_nonce_persisted() -> Result<
     // No, `handle_auth_hello` error propagates up?
     // In `handle_connection`: `handle_auth_hello(...)` result is `response_payload`.
     // If it returns Err, `handle_connection` returns Err, closing connection.
-    
-    let read_result = timeout(
-        Duration::from_millis(200),
-        read_frame(&mut stream),
-    )
-    .await;
-    
+
+    let read_result = timeout(Duration::from_millis(200), read_frame(&mut stream)).await;
+
     // Either timeout (no response) or error (connection closed) is success for rejection
     match read_result {
-        Ok(Ok(_)) => return Err(anyhow!("Replay unexpectedly accepted")),
-        _ => {} // Connection closed or timeout = Good
+        Ok(Ok((h, _))) => {
+            if h.msg_type != MSG_TYPE_ERROR {
+                return Err(anyhow!("Replay unexpectedly accepted: {:?}", h));
+            }
+        }
+        Ok(Err(_)) => {} // Connection closed = Good
+        Err(_) => {}     // Timeout = Good
     }
-    
+
     handle.abort();
     Ok(())
 }
@@ -103,7 +104,7 @@ async fn edge_tcp_rejects_oversized_payload() -> Result<()> {
 
     let read_result = timeout(Duration::from_millis(200), read_frame(&mut stream)).await;
     match read_result {
-        Ok(Ok(_)) => return Err(anyhow!("oversized payload unexpectedly accepted")),
+        Ok(Ok((h, _))) => return Err(anyhow!("oversized payload unexpectedly accepted: {:?}", h)),
         Ok(Err(_)) => {}
         Err(_) => {}
     }
@@ -129,7 +130,11 @@ async fn edge_tcp_drops_invalid_header() -> Result<()> {
 
     let read_result = timeout(Duration::from_millis(200), read_frame(&mut stream)).await;
     match read_result {
-        Ok(Ok(_)) => return Err(anyhow!("invalid header unexpectedly accepted")),
+        Ok(Ok((h, _))) => {
+            if h.msg_type != MSG_TYPE_ERROR {
+                return Err(anyhow!("invalid header unexpectedly accepted: {:?}", h));
+            }
+        }
         Ok(Err(_)) => {}
         Err(_) => {}
     }

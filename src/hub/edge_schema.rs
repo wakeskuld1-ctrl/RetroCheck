@@ -1,16 +1,71 @@
 pub use crate::hub::edge_session_schema::{
-    decode_auth_ack, decode_auth_hello, decode_signed_response, decode_session_request,
-    encode_auth_ack, encode_auth_hello, encode_signed_response, encode_session_request, AuthAck,
-    SessionMeta, SessionRequestMeta, SignedResponse,
+    AuthAck, SessionMeta, SessionRequestMeta, SignedResponse, decode_auth_ack, decode_auth_hello,
+    decode_session_request, decode_signed_response, encode_auth_ack, encode_auth_hello,
+    encode_session_request, encode_signed_response,
 };
 
 use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, Table, WIPOffset};
 
+pub(crate) fn verify_buffer_structure(buf: &[u8]) -> anyhow::Result<()> {
+    if buf.len() < 4 {
+        return Err(anyhow::anyhow!("Buffer too small"));
+    }
+    // Read root offset (uoffset_t, u32)
+    let root_offset = unsafe { flatbuffers::read_scalar::<u32>(&buf[0..4]) } as usize;
+
+    if root_offset >= buf.len() {
+        return Err(anyhow::anyhow!(
+            "Root table offset {} out of bounds (len {})",
+            root_offset,
+            buf.len()
+        ));
+    }
+
+    // A table starts with an sob (soffset_t, i32) pointing backwards to vtable.
+    if root_offset + 4 > buf.len() {
+        return Err(anyhow::anyhow!("Root table start out of bounds"));
+    }
+
+    let soffset = unsafe { flatbuffers::read_scalar::<i32>(&buf[root_offset..root_offset + 4]) };
+    let vtable_offset = (root_offset as i32 - soffset) as usize;
+
+    if vtable_offset >= buf.len() {
+        return Err(anyhow::anyhow!(
+            "Vtable offset {} out of bounds",
+            vtable_offset
+        ));
+    }
+
+    if vtable_offset + 4 > buf.len() {
+        // Vtable needs at least 4 bytes (vbytes, fbytes)
+        return Err(anyhow::anyhow!("Vtable header out of bounds"));
+    }
+
+    // vbytes: size of vtable (u16)
+    let vbytes =
+        unsafe { flatbuffers::read_scalar::<u16>(&buf[vtable_offset..vtable_offset + 2]) } as usize;
+
+    if vtable_offset + vbytes > buf.len() {
+        return Err(anyhow::anyhow!("Vtable size {} out of bounds", vbytes));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum EdgeRequest {
-    Heartbeat { node_id: u64, timestamp: u64 },
-    UploadData { records: Vec<DataRecord> },
-    AuthHello { device_id: u64, timestamp: u64, nonce: u64 },
+    Heartbeat {
+        node_id: u64,
+        timestamp: u64,
+    },
+    UploadData {
+        records: Vec<DataRecord>,
+    },
+    AuthHello {
+        device_id: u64,
+        timestamp: u64,
+        nonce: u64,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -98,6 +153,8 @@ pub fn encode_request<'b>(
 }
 
 pub fn decode_request(buf: &[u8]) -> anyhow::Result<EdgeRequest> {
+    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid FlatBuffer: {}", e))?;
+
     let parsed = std::panic::catch_unwind(|| {
         let req_table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
         let req_type = unsafe { req_table.get::<u8>(4, Some(0)).unwrap_or(0) };
@@ -113,20 +170,22 @@ pub fn decode_request(buf: &[u8]) -> anyhow::Result<EdgeRequest> {
             2 => {
                 let records_vec = unsafe {
                     req_table.get::<ForwardsUOffset<flatbuffers::Vector<ForwardsUOffset<Table>>>>(
-                        4,
-                        None,
+                        4, None,
                     )
                 }
                 .ok_or_else(|| anyhow::anyhow!("Missing records"))?;
+
+                if records_vec.len() > 10000 {
+                    return Err(anyhow::anyhow!("Too many records: {}", records_vec.len()));
+                }
 
                 let mut records = Vec::new();
                 for i in 0..records_vec.len() {
                     let r = records_vec.get(i);
                     let key = unsafe { r.get::<ForwardsUOffset<&str>>(4, None).unwrap_or("") };
-                    let val_vec = unsafe {
-                        r.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(6, None)
-                    }
-                    .ok_or_else(|| anyhow::anyhow!("Missing value"))?;
+                    let val_vec =
+                        unsafe { r.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(6, None) }
+                            .ok_or_else(|| anyhow::anyhow!("Missing value"))?;
                     let timestamp = unsafe { r.get::<u64>(8, Some(0)).unwrap_or(0) };
 
                     records.push(DataRecord {

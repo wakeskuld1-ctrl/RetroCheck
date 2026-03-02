@@ -22,7 +22,7 @@ async fn raft_applies_log_to_sqlite() {
     let mut members = std::collections::BTreeSet::new();
     members.insert(1);
     node.raft.initialize(members).await.unwrap();
-    
+
     // 等待成为 Leader
     loop {
         let metrics = node.raft.metrics().borrow().clone();

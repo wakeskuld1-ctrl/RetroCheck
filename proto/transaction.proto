@@ -10,6 +10,14 @@ service DatabaseService {
   rpc CheckHealth (Empty) returns (Empty);
 }
 
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要提供顺序规则热更新的管理接口
+// - 目的: 支持网关侧规则动态下发与版本查询
+service OrderRulesAdmin {
+  rpc UpdateRules (UpdateRulesRequest) returns (UpdateRulesResponse);
+  rpc GetRulesVersion (GetRulesVersionRequest) returns (GetRulesVersionResponse);
+}
+
 message ExecuteRequest { string sql = 1; }
 message ExecuteResponse { int32 rows_affected = 1; }
 
@@ -30,3 +38,20 @@ message GetVersionRequest { string table = 1; }
 message GetVersionResponse { int32 version = 1; }
 
 message Empty {}
+
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要携带规则 JSON
+// - 目的: 支持管理侧原子替换规则集
+message UpdateRulesRequest { string rules_json = 1; }
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要回执规则版本
+// - 目的: 便于管理侧确认热更新成功
+message UpdateRulesResponse { uint64 version = 1; }
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要查询规则版本
+// - 目的: 便于监控与配置一致性校验
+message GetRulesVersionRequest {}
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要返回当前规则版本
+// - 目的: 为管理侧提供可观测性
+message GetRulesVersionResponse { uint64 version = 1; }

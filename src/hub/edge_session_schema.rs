@@ -3,7 +3,9 @@ use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, Table, WIPOffset};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::hub::edge_schema::{decode_request, encode_request, EdgeRequest};
+use crate::hub::edge_schema::{
+    EdgeRequest, decode_request, encode_request, verify_buffer_structure,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -123,14 +125,15 @@ pub fn decode_auth_hello<F>(buf: &[u8], lookup_key: F) -> anyhow::Result<(Sessio
 where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
+    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid AuthHello: {}", e))?;
+
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
         let device_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
         let timestamp_ms = unsafe { table.get::<u64>(6, Some(0)).unwrap_or(0) };
         let nonce = unsafe { table.get::<u64>(8, Some(0)).unwrap_or(0) };
-        let mac_vec =
-            unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
-                .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
+        let mac_vec = unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
+            .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
 
         let secret = lookup_key(device_id).ok_or_else(|| anyhow::anyhow!("Unknown device"))?;
         let signing = auth_hello_signing_input(device_id, timestamp_ms, nonce);
@@ -185,6 +188,8 @@ pub fn encode_auth_ack<'b>(
 }
 
 pub fn decode_auth_ack(buf: &[u8]) -> anyhow::Result<AuthAck> {
+    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid AuthAck: {}", e))?;
+
     let parsed = std::panic::catch_unwind(|| {
         let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
         let session_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
@@ -242,14 +247,15 @@ pub fn decode_session_request<F>(
 where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
+    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid SessionRequest: {}", e))?;
+
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
         let session_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
         let timestamp_ms = unsafe { table.get::<u64>(6, Some(0)).unwrap_or(0) };
         let nonce = unsafe { table.get::<u64>(8, Some(0)).unwrap_or(0) };
-        let mac_vec =
-            unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
-                .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
+        let mac_vec = unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
+            .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
         let payload_vec =
             unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(12, None) }
                 .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
@@ -290,14 +296,9 @@ pub fn encode_signed_response<'b>(
     payload: &[u8],
     session_key: &[u8],
 ) -> WIPOffset<Table<'b>> {
-    let signing = signed_response_signing_input(
-        header_prefix,
-        session_id,
-        timestamp_ms,
-        nonce,
-        payload,
-    )
-    .expect("header_prefix must be 14 bytes");
+    let signing =
+        signed_response_signing_input(header_prefix, session_id, timestamp_ms, nonce, payload)
+            .expect("header_prefix must be 14 bytes");
     let mac = hmac_truncate_16(session_key, &signing).expect("HMAC should accept any length key");
     let payload_vec = builder.create_vector(payload);
     let mac_vec = builder.create_vector(&mac);
@@ -319,14 +320,15 @@ pub fn decode_signed_response<F>(
 where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
+    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid SignedResponse: {}", e))?;
+
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
         let session_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
         let timestamp_ms = unsafe { table.get::<u64>(6, Some(0)).unwrap_or(0) };
         let nonce = unsafe { table.get::<u64>(8, Some(0)).unwrap_or(0) };
-        let mac_vec =
-            unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
-                .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
+        let mac_vec = unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
+            .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
         let payload_vec =
             unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(12, None) }
                 .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;

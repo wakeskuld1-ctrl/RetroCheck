@@ -1,19 +1,21 @@
 #![allow(dead_code)]
 
-use anyhow::{anyhow, Result};
-use check_program::hub::edge_gateway::{
-    validate_header, EdgeGateway, Header, HEADER_SIZE, MAGIC, MSG_TYPE_RESPONSE, VERSION,
-};
-use check_program::hub::edge_schema::{
-    encode_auth_hello, encode_session_request, DataRecord, EdgeRequest,
-};
+use anyhow::{Result, anyhow};
 use check_program::config::EdgeGatewayConfig;
+use check_program::hub::edge_gateway::EdgeGateway;
+use check_program::hub::edge_schema::{
+    DataRecord, EdgeRequest, encode_auth_hello, encode_session_request,
+};
+use check_program::hub::protocol::{
+    HEADER_SIZE, Header, MAGIC, MSG_TYPE_RESPONSE, VERSION, calculate_checksum, validate_header,
+};
+use check_program::management::order_rules_service::OrderRulesStore;
 use check_program::raft::router::Router;
 use flatbuffers::FlatBufferBuilder;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 async fn reserve_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -27,18 +29,44 @@ pub async fn spawn_gateway() -> Result<(String, tokio::task::JoinHandle<Result<(
     let addr = format!("127.0.0.1:{}", port);
     let router = Arc::new(Router::new_for_test(true));
     let config = EdgeGatewayConfig::default();
-    let gateway = Arc::new(EdgeGateway::new(addr.clone(), router, config)?);
+    // ### 修改记录 (2026-03-01)
+    // - 原因: 需要在测试环境注入规则存储
+    // - 目的: 保证网关顺序规则模块可用
+    let order_rules_store = Arc::new(OrderRulesStore::new());
+    let gateway = Arc::new(EdgeGateway::new(
+        addr.clone(),
+        router,
+        config,
+        order_rules_store,
+    )?);
     let handle = tokio::spawn(gateway.run());
     Ok((addr, handle))
 }
 
-pub async fn spawn_gateway_with_config(config_path: &std::path::Path) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+pub async fn spawn_gateway_with_config(
+    config_path: &std::path::Path,
+) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
+    let config = EdgeGatewayConfig::load_from_file(config_path)?;
+    spawn_gateway_with_custom_config(config).await
+}
+
+pub async fn spawn_gateway_with_custom_config(
+    config: EdgeGatewayConfig,
+) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
     let port = reserve_port().await?;
     let addr = format!("127.0.0.1:{}", port);
-    let router = Arc::new(Router::new_for_test(true));
-    let config = EdgeGatewayConfig::load_from_file(config_path)?;
-    let gateway = Arc::new(EdgeGateway::new(addr.clone(), router, config)?);
-    let handle = tokio::spawn(gateway.run());
+    let router = Arc::new(check_program::raft::router::Router::new_for_test(true));
+    // ### 修改记录 (2026-03-01)
+    // - 原因: 需要在自定义配置测试中注入规则存储
+    // - 目的: 保证顺序调度测试可用
+    let order_rules_store = Arc::new(OrderRulesStore::new());
+    let gateway = Arc::new(EdgeGateway::new(
+        addr.clone(),
+        router,
+        config,
+        order_rules_store,
+    )?);
+    let handle = tokio::spawn(async move { gateway.run().await });
     Ok((addr, handle))
 }
 
@@ -64,7 +92,8 @@ pub async fn send_frame(
     header[5] = msg_type;
     header[6..14].copy_from_slice(&request_id.to_be_bytes());
     header[14..18].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-    header[18..21].copy_from_slice(&[0u8; 3]);
+    let checksum = calculate_checksum(payload);
+    header[18..21].copy_from_slice(&checksum);
     stream.write_all(&header).await?;
     stream.write_all(payload).await?;
     Ok(())
@@ -84,6 +113,8 @@ pub async fn send_raw_header(
     header[5] = msg_type;
     header[6..14].copy_from_slice(&request_id.to_be_bytes());
     header[14..18].copy_from_slice(&payload_len.to_be_bytes());
+    // For raw header test, we might send 0 checksum or invalid one, but here we just zero it out
+    // as this function is used for negative tests where payload might not match or exist
     header[18..21].copy_from_slice(&[0u8; 3]);
     stream.write_all(&header).await?;
     Ok(())
@@ -99,13 +130,22 @@ pub async fn read_frame(stream: &mut TcpStream) -> Result<(Header, Vec<u8>)> {
 }
 
 pub fn build_auth_hello(device_id: u64, timestamp_ms: u64, nonce: u64) -> Vec<u8> {
+    build_auth_hello_with_key(device_id, timestamp_ms, nonce, b"device_secret")
+}
+
+pub fn build_auth_hello_with_key(
+    device_id: u64,
+    timestamp_ms: u64,
+    nonce: u64,
+    key: &[u8],
+) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
     let req = EdgeRequest::AuthHello {
         device_id,
         timestamp: timestamp_ms,
         nonce,
     };
-    let root = encode_auth_hello(&mut builder, b"device_secret", &req);
+    let root = encode_auth_hello(&mut builder, key, &req);
     builder.finish(root, None);
     builder.finished_data().to_vec()
 }
@@ -123,7 +163,14 @@ pub fn build_session_request(
         timestamp: 100,
     }];
     let req = EdgeRequest::UploadData { records };
-    let root = encode_session_request(&mut builder, session_id, timestamp_ms, nonce, session_key, &req);
+    let root = encode_session_request(
+        &mut builder,
+        session_id,
+        timestamp_ms,
+        nonce,
+        session_key,
+        &req,
+    );
     builder.finish(root, None);
     builder.finished_data().to_vec()
 }

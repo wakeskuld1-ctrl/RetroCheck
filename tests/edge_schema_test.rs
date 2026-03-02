@@ -1,4 +1,4 @@
-use check_program::hub::edge_schema::{decode_request, encode_request, DataRecord, EdgeRequest};
+use check_program::hub::edge_schema::{DataRecord, EdgeRequest, decode_request, encode_request};
 use flatbuffers::FlatBufferBuilder;
 
 #[test]
@@ -8,13 +8,13 @@ fn test_heartbeat_encoding() {
         node_id: 12345,
         timestamp: 99999,
     };
-    
+
     let root = encode_request(&mut builder, &req);
     builder.finish(root, None);
-    
+
     let buf = builder.finished_data();
     let decoded = decode_request(buf).unwrap();
-    
+
     assert_eq!(decoded, req);
 }
 
@@ -34,12 +34,12 @@ fn test_upload_data_encoding() {
         },
     ];
     let req = EdgeRequest::UploadData { records };
-    
+
     let root = encode_request(&mut builder, &req);
     builder.finish(root, None);
-    
+
     let buf = builder.finished_data();
     let decoded = decode_request(buf).unwrap();
-    
+
     assert_eq!(decoded, req);
 }

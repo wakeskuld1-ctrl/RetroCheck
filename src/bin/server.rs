@@ -1,14 +1,16 @@
+use check_program::config::EdgeGatewayConfig;
 use check_program::engine::StorageEngine;
+use check_program::hub::edge_gateway::EdgeGateway;
+use check_program::management::order_rules_service::{OrderRulesAdminService, OrderRulesStore};
 use check_program::pb::database_service_server::{DatabaseService, DatabaseServiceServer};
+use check_program::pb::order_rules_admin_server::OrderRulesAdminServer;
 use check_program::pb::{
     CommitRequest, CommitResponse, Empty, ExecuteRequest, ExecuteResponse, GetVersionRequest,
     GetVersionResponse, PrepareRequest, PrepareResponse, RollbackRequest, RollbackResponse,
 };
 use check_program::raft::router::Router;
-use check_program::hub::edge_gateway::EdgeGateway;
-use check_program::config::EdgeGatewayConfig;
-use std::path::Path;
 use clap::Parser;
+use std::path::Path;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, transport::Server};
 // ### 修改记录 (2026-02-17)
@@ -289,7 +291,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要将写路径切换到 Router
     // - 目的: 保持协议不变的同时完成内部替换
-    let (engine, router): (Arc<dyn StorageEngine>, Option<Arc<Router>>) = match args.engine.as_str() {
+    let (engine, router): (Arc<dyn StorageEngine>, Option<Arc<Router>>) = match args.engine.as_str()
+    {
         "sqlite" => {
             // ### 修改记录 (2026-02-17)
             // - 原因: 需要引入 RaftNode 写路径
@@ -303,23 +306,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let service = DbServiceImpl::new(engine);
+    // ### 修改记录 (2026-03-01)
+    // - 原因: 需要初始化顺序规则管理服务
+    // - 目的: 支持规则热更新与版本查询
+    let order_rules_store = Arc::new(OrderRulesStore::new());
+    let order_rules_service = OrderRulesAdminService::new(order_rules_store.clone());
 
     // Start Edge Gateway if configured
-    if let Some(router) = router {
-        if let Some(config_path) = args.edge_config {
-            let config = EdgeGatewayConfig::load_from_file(Path::new(&config_path))?;
-            let edge_addr = format!("0.0.0.0:{}", args.edge_port);
-            let gateway = EdgeGateway::new(edge_addr, router, config)?;
-            tokio::spawn(async move {
-                if let Err(e) = Arc::new(gateway).run().await {
-                    eprintln!("EdgeGateway error: {:?}", e);
-                }
-            });
-        }
+    // ### 修改记录 (2026-03-01)
+    // - 原因: clippy 提示可合并条件判断
+    // - 目的: 保持网关启动逻辑不变
+    if let Some(router) = router
+        && let Some(config_path) = args.edge_config
+    {
+        let config = EdgeGatewayConfig::load_from_file(Path::new(&config_path))?;
+        let edge_addr = format!("0.0.0.0:{}", args.edge_port);
+        // ### 修改记录 (2026-03-01)
+        // - 原因: 需要将规则存储注入网关侧
+        // - 目的: 让网关读取热更新后的顺序规则
+        let gateway = EdgeGateway::new(edge_addr, router, config, order_rules_store.clone())?;
+        tokio::spawn(async move {
+            if let Err(e) = Arc::new(gateway).run().await {
+                eprintln!("EdgeGateway error: {:?}", e);
+            }
+        });
     }
 
     // Start serving requests
     Server::builder()
+        // ### 修改记录 (2026-03-01)
+        // - 原因: 需要提供规则管理 gRPC 服务
+        // - 目的: 支持顺序规则热更新
+        .add_service(OrderRulesAdminServer::new(order_rules_service))
         .add_service(DatabaseServiceServer::new(service))
         .serve(addr)
         .await?;

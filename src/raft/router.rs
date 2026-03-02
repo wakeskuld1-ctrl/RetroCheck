@@ -41,30 +41,30 @@ impl BatchWriter {
         let (tx, mut rx) = mpsc::channel::<BatchItem>(queue_size);
         let max_batch_size = config.max_batch_size;
         let max_delay_ms = config.max_delay_ms;
-        
+
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(max_batch_size);
-            
+
             loop {
                 // 1. 获取第一个元素 (如果通道关闭则退出)
                 let first = match rx.recv().await {
                     Some(item) => item,
                     None => break,
                 };
-                
+
                 batch.push(first);
-                
+
                 // 2. 尝试收集更多元素，直到超时或达到最大批次
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(max_delay_ms);
-                
+
                 loop {
                     if batch.len() >= max_batch_size {
                         break;
                     }
-                    
+
                     let timeout = tokio::time::sleep_until(deadline);
                     tokio::pin!(timeout);
-                    
+
                     tokio::select! {
                         _ = timeout => {
                             break;
@@ -77,7 +77,7 @@ impl BatchWriter {
                         }
                     }
                 }
-                
+
                 // 3. 过滤已取消的请求
                 let mut active_items = Vec::with_capacity(batch.len());
                 for item in batch.drain(..) {
@@ -87,11 +87,11 @@ impl BatchWriter {
                         active_items.push(item);
                     }
                 }
-                
+
                 if active_items.is_empty() {
                     continue;
                 }
-                
+
                 // 4. 提交给 RaftNode
                 let sqls: Vec<String> = active_items.iter().map(|item| item.sql.clone()).collect();
                 // 批次大小用于返回结果 (目前 Raft 响应只是受影响行数，这里简化处理)
@@ -102,7 +102,7 @@ impl BatchWriter {
                         // 由于 apply_sql_batch 返回的是批次大小
                         // 我们给每个请求返回 1 表示成功
                         for item in active_items {
-                             let _ = item.resp.send(Ok(1));
+                            let _ = item.resp.send(Ok(1));
                         }
                     }
                     Err(e) => {
@@ -114,7 +114,7 @@ impl BatchWriter {
                 }
             }
         });
-        
+
         Self { sender: tx }
     }
 
@@ -252,6 +252,37 @@ impl Router {
                 // - 目的: 返回明确错误便于上层处理
                 Err(anyhow!("Not leader and leader address unknown"))
             }
+        }
+    }
+
+    /// ### 修改记录 (2026-03-01)
+    /// - 原因: EdgeGateway Smart Batcher 需要批量写入接口
+    /// - 目的: 将一批 SQL 作为一个写入单元提交
+    pub async fn write_batch(&self, sqls: Vec<String>) -> Result<usize> {
+        if sqls.is_empty() {
+            return Ok(0);
+        }
+
+        if self.is_leader {
+            if let Some(raft_node) = &self.raft_node {
+                // ### 修改记录 (2026-03-01)
+                // - 原因: 批量写入必须走 Raft 一致性路径
+                // - 目的: 保证写入不会绕过共识
+                raft_node.apply_sql_batch(sqls).await
+            } else if let Some(state_machine) = &self.state_machine {
+                // ### 修改记录 (2026-03-01)
+                // - 原因: 测试场景可能未启用 Raft
+                // - 目的: 允许本地状态机批量执行
+                let results = state_machine.apply_batch(sqls).await?;
+                Ok(results.len())
+            } else {
+                Ok(0)
+            }
+        } else {
+            // ### 修改记录 (2026-03-01)
+            // - 原因: follower 无法直接处理批量写
+            // - 目的: 避免隐藏的一致性风险
+            Err(anyhow!("Batch write not supported on follower"))
         }
     }
 
@@ -434,7 +465,7 @@ impl Router {
                     .await?;
                 Ok(value.parse::<u64>().unwrap_or(0))
             } else if let Some(raft_node) = &self.raft_node {
-                 // ### 修改记录 (2026-02-28)
+                // ### 修改记录 (2026-02-28)
                 // - 原因: RaftNode 场景也需要查询时间
                 // - 目的: 修复快照调度在 Raft 模式下的空指针异常
                 let value = raft_node
@@ -456,7 +487,7 @@ impl Router {
         if self.is_leader {
             let safe_path = snapshot_path.replace('\'', "''");
             let sql = format!("VACUUM INTO '{}'", safe_path);
-            
+
             if let Some(state_machine) = &self.state_machine {
                 let _ = state_machine.apply_write(sql).await?;
                 Ok(())

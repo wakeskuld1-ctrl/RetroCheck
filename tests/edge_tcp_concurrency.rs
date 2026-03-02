@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Result};
-use check_program::hub::edge_gateway::{
+use anyhow::{Result, anyhow};
+use check_program::hub::edge_schema::{decode_auth_ack, decode_signed_response};
+use check_program::hub::protocol::{
     MSG_TYPE_AUTH_HELLO, MSG_TYPE_RESPONSE, MSG_TYPE_SESSION_REQUEST,
 };
-use check_program::hub::edge_schema::{decode_auth_ack, decode_signed_response};
+use serde_json::Value;
 
 mod edge_tcp_common;
 use edge_tcp_common::{
@@ -48,8 +49,10 @@ async fn edge_tcp_allows_parallel_sessions() -> Result<()> {
                     None
                 }
             })?;
-            if signed.payload != b"OK" {
-                return Err(anyhow!("unexpected payload"));
+
+            let response: Value = serde_json::from_slice(&signed.payload)?;
+            if response["success"].as_u64().unwrap_or(0) != 1 {
+                return Err(anyhow!("unexpected payload: {:?}", response));
             }
             Ok::<(), anyhow::Error>(())
         }));
