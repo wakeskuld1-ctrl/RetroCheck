@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,10 @@ impl WalLogger {
     }
 
     pub fn log(&self, entry: &str) -> Result<()> {
-        let mut file = self.log_file.lock().unwrap();
+        let mut file = self
+            .log_file
+            .lock()
+            .map_err(|_| anyhow!("wal log_file mutex poisoned"))?;
         writeln!(file, "{}", entry)?;
         Ok(())
     }
@@ -41,7 +44,10 @@ impl WalLogger {
         if std::path::Path::new(&rotated_path).exists() {
             std::fs::remove_file(&rotated_path)?;
         }
-        let mut file = self.log_file.lock().unwrap();
+        let mut file = self
+            .log_file
+            .lock()
+            .map_err(|_| anyhow!("wal log_file mutex poisoned"))?;
         file.sync_all()?;
         match std::fs::rename(&self.path, &rotated_path) {
             Ok(_) => {
@@ -57,6 +63,43 @@ impl WalLogger {
                 file.seek(SeekFrom::End(0))?;
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wal_logger_log_returns_error_when_mutex_poisoned() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("test.log");
+        let logger = WalLogger::new(wal_path.to_str().ok_or(anyhow!("invalid wal path"))?)?;
+        let poison_logger = logger.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_logger.log_file.lock().unwrap();
+            panic!("poison wal lock");
+        });
+        let result = std::panic::catch_unwind(|| logger.log("entry"));
+        assert!(result.is_ok());
+        assert!(result.expect("log call should not panic").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn wal_logger_rotate_returns_error_when_mutex_poisoned() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("test.log");
+        let logger = WalLogger::new(wal_path.to_str().ok_or(anyhow!("invalid wal path"))?)?;
+        let poison_logger = logger.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_logger.log_file.lock().unwrap();
+            panic!("poison wal lock");
+        });
+        let result = std::panic::catch_unwind(|| logger.rotate());
+        assert!(result.is_ok());
+        assert!(result.expect("rotate call should not panic").is_err());
         Ok(())
     }
 }

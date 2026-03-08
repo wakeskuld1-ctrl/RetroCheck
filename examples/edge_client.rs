@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
         timestamp,
         nonce,
     };
-    let offset = encode_auth_hello(&mut builder, secret_bytes, &req);
+    let offset = encode_auth_hello(&mut builder, secret_bytes, &req)?;
     builder.finish(offset, None);
     let payload = builder.finished_data().to_vec();
 
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
             req_nonce,
             &session_key,
             &data_req,
-        );
+        )?;
         builder.finish(offset, None);
         let payload = builder.finished_data().to_vec();
 

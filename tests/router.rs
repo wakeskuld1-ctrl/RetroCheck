@@ -19,7 +19,9 @@ use check_program::pb::{
 // ### 修改记录 (2026-02-25)
 // - 原因: 需要构造真实 Router 作为 Leader
 // - 目的: 让转发链路能执行写入
+use check_program::raft::raft_node::TestCluster;
 use check_program::raft::router::Router;
+use openraft::ServerState;
 // ### 修改记录 (2026-02-25)
 // - 原因: 需要在测试中共享 Router
 // - 目的: 避免重复初始化并简化生命周期
@@ -688,4 +690,118 @@ async fn router_forward_preserves_execute_error_message() {
     // - 原因: 错误内容需要包含原始片段
     // - 目的: 确认错误透传而非统一替换
     assert!(msg.contains(&secret));
+}
+
+#[tokio::test]
+async fn router_new_with_raft_follows_current_leader_after_failover() {
+    let mut cluster = TestCluster::new(3).await.unwrap();
+    let leader_node = loop {
+        let mut found = None;
+        for node in &cluster.nodes {
+            let metrics = node.raft.metrics().borrow().clone();
+            if metrics.state == ServerState::Leader
+                && matches!(metrics.current_leader, Some(id) if id == node.node_id())
+            {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        if let Some(node) = found {
+            break node;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let router = Router::new_with_raft(leader_node);
+    router
+        .write("CREATE TABLE IF NOT EXISTS t(x INT)".to_string())
+        .await
+        .unwrap();
+    cluster.fail_leader().await.unwrap();
+    let err = router
+        .write("INSERT INTO t(x) VALUES (1)".to_string())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Not leader and leader address unknown")
+    );
+}
+
+#[tokio::test]
+async fn router_follower_can_forward_write_batch_to_leader() {
+    let temp_dir = TempDir::new().unwrap();
+    let leader_db = temp_dir.path().join("leader_batch.db");
+    let leader_router = Router::new_local_leader(leader_db.to_string_lossy().to_string()).unwrap();
+    let leader_addr = spawn_test_server(Arc::new(leader_router)).await;
+    let follower_router = Router::new_follower_with_leader_addr(leader_addr);
+    follower_router
+        .write("CREATE TABLE IF NOT EXISTS t(x INT)".to_string())
+        .await
+        .unwrap();
+    let rows = follower_router
+        .write_batch(vec![
+            "INSERT INTO t(x) VALUES (1)".to_string(),
+            "INSERT INTO t(x) VALUES (2)".to_string(),
+        ])
+        .await
+        .unwrap();
+    assert!(rows > 0);
+}
+
+#[tokio::test]
+async fn router_failover_recovers_write_after_new_leader_router_rebind() {
+    let mut cluster = TestCluster::new(3).await.unwrap();
+    let initial_leader = loop {
+        let mut found = None;
+        for node in &cluster.nodes {
+            let metrics = node.raft.metrics().borrow().clone();
+            if metrics.state == ServerState::Leader
+                && matches!(metrics.current_leader, Some(id) if id == node.node_id())
+            {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        if let Some(node) = found {
+            break node;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let initial_leader_id = initial_leader.node_id();
+    let initial_router = Router::new_with_raft(initial_leader);
+    initial_router
+        .write("CREATE TABLE IF NOT EXISTS t(x INT)".to_string())
+        .await
+        .unwrap();
+    let before_rows = initial_router
+        .write("INSERT INTO t(x) VALUES (1)".to_string())
+        .await
+        .unwrap();
+    assert_eq!(before_rows, 1);
+
+    cluster.fail_leader().await.unwrap();
+
+    let new_leader = loop {
+        let mut found = None;
+        for node in &cluster.nodes {
+            let metrics = node.raft.metrics().borrow().clone();
+            if metrics.state == ServerState::Leader
+                && node.node_id() != initial_leader_id
+                && matches!(metrics.current_leader, Some(id) if id == node.node_id())
+            {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        if let Some(node) = found {
+            break node;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let rebound_router = Router::new_with_raft(new_leader);
+    let after_rows = rebound_router
+        .write("INSERT INTO t(x) VALUES (2)".to_string())
+        .await
+        .unwrap();
+    assert_eq!(after_rows, 1);
 }

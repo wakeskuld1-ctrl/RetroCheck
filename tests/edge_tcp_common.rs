@@ -24,10 +24,28 @@ async fn reserve_port() -> Result<u16> {
     Ok(port)
 }
 
+// ### 修改记录 (2026-03-03)
+// - 原因: new_for_test 现在使用真实 SQLite
+// - 目的: 测试启动前确保 data 表存在
+// - 备注: 避免 UploadData 写入失败
+async fn ensure_data_table(router: &Arc<Router>) -> Result<()> {
+    router
+        .write(
+            "CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value BLOB, timestamp INTEGER)"
+                .to_string(),
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn spawn_gateway() -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
     let port = reserve_port().await?;
     let addr = format!("127.0.0.1:{}", port);
     let router = Arc::new(Router::new_for_test(true));
+    // ### 修改记录 (2026-03-03)
+    // - 原因: UploadData 依赖 data 表
+    // - 目的: 统一测试网关启动前的表准备
+    ensure_data_table(&router).await?;
     let config = EdgeGatewayConfig::default();
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要在测试环境注入规则存储
@@ -56,6 +74,10 @@ pub async fn spawn_gateway_with_custom_config(
     let port = reserve_port().await?;
     let addr = format!("127.0.0.1:{}", port);
     let router = Arc::new(check_program::raft::router::Router::new_for_test(true));
+    // ### 修改记录 (2026-03-03)
+    // - 原因: UploadData 依赖 data 表
+    // - 目的: 确保自定义配置测试可写
+    ensure_data_table(&router).await?;
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要在自定义配置测试中注入规则存储
     // - 目的: 保证顺序调度测试可用
@@ -145,7 +167,8 @@ pub fn build_auth_hello_with_key(
         timestamp: timestamp_ms,
         nonce,
     };
-    let root = encode_auth_hello(&mut builder, key, &req);
+    let root = encode_auth_hello(&mut builder, key, &req)
+        .expect("build_auth_hello_with_key should encode valid AuthHello request");
     builder.finish(root, None);
     builder.finished_data().to_vec()
 }
@@ -170,7 +193,8 @@ pub fn build_session_request(
         nonce,
         session_key,
         &req,
-    );
+    )
+    .expect("build_session_request should encode valid UploadData request");
     builder.finish(root, None);
     builder.finished_data().to_vec()
 }

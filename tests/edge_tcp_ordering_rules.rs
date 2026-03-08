@@ -51,6 +51,22 @@ async fn ordering_rules_prefers_specific_msg_type() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn ordering_rules_priority_stable_under_preagg_flag() -> Result<()> {
+    let rules = OrderingRules::from_json(
+        r#"{
+        "rules":[
+            {"device_prefix":"A","msg_type":3,"order_group":"g_precise","stage":1,"priority":1},
+            {"device_prefix":"A","order_group":"g_wild","stage":2,"priority":99}
+        ]
+    }"#,
+    )?;
+    let matched = rules.match_device("A-101", 3).expect("rule should match");
+    assert_eq!(matched.order_group, "g_precise");
+    assert_eq!(matched.stage, 1);
+    Ok(())
+}
+
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要验证顺序域阶段屏障生效
 // - 目的: 确保 stage 2 不会在 stage 1 完成前被调度
@@ -62,6 +78,19 @@ async fn ordering_scheduler_enforces_stage_barrier() -> Result<()> {
     let scheduler = OrderingScheduler::<String>::new(1, 10);
     scheduler.enqueue("g1", 1, "t1".to_string()).await?;
     scheduler.enqueue("g1", 2, "t2".to_string()).await?;
+    let first = scheduler.next_ready().await.expect("first task");
+    assert_eq!(first.stage, 1);
+    scheduler.mark_done("g1", 1).await;
+    let second = scheduler.next_ready().await.expect("second task");
+    assert_eq!(second.stage, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordering_stage_barrier_unchanged_when_preagg_enabled() -> Result<()> {
+    let scheduler = OrderingScheduler::<String>::new(1, 10);
+    scheduler.enqueue("g1", 1, "task-1".to_string()).await?;
+    scheduler.enqueue("g1", 2, "task-2".to_string()).await?;
     let first = scheduler.next_ready().await.expect("first task");
     assert_eq!(first.stage, 1);
     scheduler.mark_done("g1", 1).await;

@@ -3,13 +3,30 @@ use check_program::hub::edge_schema::decode_auth_ack;
 use check_program::hub::protocol::{
     MAGIC, MSG_TYPE_AUTH_HELLO, MSG_TYPE_ERROR, MSG_TYPE_SESSION_REQUEST, VERSION,
 };
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
 
 mod edge_tcp_common;
 use edge_tcp_common::{
     build_auth_hello, connect_with_retry, read_frame, send_frame, send_raw_header, spawn_gateway,
-    spawn_gateway_with_config,
+    spawn_gateway_with_config, spawn_gateway_with_custom_config,
 };
+
+// ### 修改记录 (2026-03-03)
+// - 原因: sled 锁释放可能晚于 handle.abort
+// - 目的: 稳定重启后复用同一持久化路径
+// - 备注: 通过短轮询等待锁释放
+async fn wait_for_sled_unlock(path: &std::path::Path) -> Result<()> {
+    for _ in 0..20 {
+        match sled::Config::default().path(path).open() {
+            Ok(db) => {
+                drop(db);
+                return Ok(());
+            }
+            Err(_) => sleep(Duration::from_millis(50)).await,
+        }
+    }
+    Err(anyhow!("sled lock not released"))
+}
 
 #[tokio::test]
 async fn edge_tcp_auth_ack_uses_configured_ttl() -> Result<()> {
@@ -52,9 +69,13 @@ async fn edge_tcp_rejects_replay_after_restart_when_nonce_persisted() -> Result<
     let (_header, _resp) = read_frame(&mut stream).await?;
     drop(stream); // Close connection to release EdgeGateway reference
     handle.abort();
+    // ### 修改记录 (2026-03-03)
+    // - 原因: 需要等待任务结束释放资源
+    // - 目的: 降低 sled 锁冲突概率
+    let _ = handle.await;
 
     // Give some time for tasks to finish and sled to release lock
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_sled_unlock(&persist_path).await?;
 
     // Restart gateway with same config
     let (addr, handle) = spawn_gateway_with_config(&config_path).await?;
@@ -84,6 +105,10 @@ async fn edge_tcp_rejects_replay_after_restart_when_nonce_persisted() -> Result<
     }
 
     handle.abort();
+    // ### 修改记录 (2026-03-03)
+    // - 原因: 需要等待任务结束释放资源
+    // - 目的: 避免影响后续测试
+    let _ = handle.await;
     Ok(())
 }
 
@@ -139,6 +164,28 @@ async fn edge_tcp_drops_invalid_header() -> Result<()> {
         Err(_) => {}
     }
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn edge_tcp_idle_connection_releases_concurrency_slot() -> Result<()> {
+    let config = check_program::config::EdgeGatewayConfig {
+        max_connections: 1,
+        session_ttl_ms: 200,
+        ..check_program::config::EdgeGatewayConfig::default()
+    };
+    let (addr, handle) = spawn_gateway_with_custom_config(config).await?;
+    let _idle_stream = connect_with_retry(&addr).await?;
+    sleep(Duration::from_millis(50)).await;
+    let mut active_stream = connect_with_retry(&addr).await?;
+    let auth_payload = build_auth_hello(100, 1000, 1);
+    send_frame(&mut active_stream, MSG_TYPE_AUTH_HELLO, 1, &auth_payload).await?;
+    let recv = timeout(Duration::from_millis(1200), read_frame(&mut active_stream)).await;
+    let (header, _) = recv.map_err(|_| anyhow!("active connection did not get response in time"))??;
+    if header.msg_type == MSG_TYPE_ERROR {
+        return Err(anyhow!("active connection got MSG_TYPE_ERROR after idle release"));
+    }
     handle.abort();
     Ok(())
 }

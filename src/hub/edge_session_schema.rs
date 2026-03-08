@@ -99,18 +99,22 @@ pub fn encode_auth_hello<'b>(
     builder: &mut FlatBufferBuilder<'b>,
     secret: &[u8],
     req: &EdgeRequest,
-) -> WIPOffset<Table<'b>> {
+) -> anyhow::Result<WIPOffset<Table<'b>>> {
     let (device_id, timestamp_ms, nonce) = match req {
         EdgeRequest::AuthHello {
             device_id,
             timestamp,
             nonce,
         } => (*device_id, *timestamp, *nonce),
-        _ => panic!("encode_auth_hello expects EdgeRequest::AuthHello"),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "encode_auth_hello expects EdgeRequest::AuthHello"
+            ));
+        }
     };
 
     let signing = auth_hello_signing_input(device_id, timestamp_ms, nonce);
-    let mac = hmac_truncate_16(secret, &signing).expect("HMAC should accept any length key");
+    let mac = hmac_truncate_16(secret, &signing)?;
     let mac_vec = builder.create_vector(&mac);
     let start = builder.start_table();
     builder.push_slot::<u64>(4, device_id, 0);
@@ -118,7 +122,12 @@ pub fn encode_auth_hello<'b>(
     builder.push_slot::<u64>(8, nonce, 0);
     builder.push_slot_always(10, mac_vec);
     let offset = builder.end_table(start);
-    unsafe { std::mem::transmute(offset) }
+    Ok(unsafe {
+        std::mem::transmute::<
+            flatbuffers::WIPOffset<flatbuffers::TableFinishedWIPOffset>,
+            WIPOffset<Table<'b>>,
+        >(offset)
+    })
 }
 
 pub fn decode_auth_hello<F>(buf: &[u8], lookup_key: F) -> anyhow::Result<(SessionMeta, EdgeRequest)>
@@ -218,14 +227,14 @@ pub fn encode_session_request<'b>(
     nonce: u64,
     session_key: &[u8],
     req: &EdgeRequest,
-) -> WIPOffset<Table<'b>> {
+) -> anyhow::Result<WIPOffset<Table<'b>>> {
     let mut payload_builder = FlatBufferBuilder::new();
     let payload_root = encode_request(&mut payload_builder, req);
     payload_builder.finish(payload_root, None);
     let payload_bytes = payload_builder.finished_data();
 
     let signing = session_signing_input(session_id, timestamp_ms, nonce, payload_bytes);
-    let mac = hmac_truncate_16(session_key, &signing).expect("HMAC should accept any length key");
+    let mac = hmac_truncate_16(session_key, &signing)?;
 
     let payload_vec = builder.create_vector(payload_bytes);
     let mac_vec = builder.create_vector(&mac);
@@ -237,7 +246,12 @@ pub fn encode_session_request<'b>(
     builder.push_slot_always(10, mac_vec);
     builder.push_slot_always(12, payload_vec);
     let offset = builder.end_table(start);
-    unsafe { std::mem::transmute(offset) }
+    Ok(unsafe {
+        std::mem::transmute::<
+            flatbuffers::WIPOffset<flatbuffers::TableFinishedWIPOffset>,
+            WIPOffset<Table<'b>>,
+        >(offset)
+    })
 }
 
 pub fn decode_session_request<F>(
@@ -295,11 +309,11 @@ pub fn encode_signed_response<'b>(
     header_prefix: &[u8],
     payload: &[u8],
     session_key: &[u8],
-) -> WIPOffset<Table<'b>> {
+) -> anyhow::Result<WIPOffset<Table<'b>>> {
     let signing =
         signed_response_signing_input(header_prefix, session_id, timestamp_ms, nonce, payload)
-            .expect("header_prefix must be 14 bytes");
-    let mac = hmac_truncate_16(session_key, &signing).expect("HMAC should accept any length key");
+            ?;
+    let mac = hmac_truncate_16(session_key, &signing)?;
     let payload_vec = builder.create_vector(payload);
     let mac_vec = builder.create_vector(&mac);
     let start = builder.start_table();
@@ -309,7 +323,12 @@ pub fn encode_signed_response<'b>(
     builder.push_slot_always(10, mac_vec);
     builder.push_slot_always(12, payload_vec);
     let offset = builder.end_table(start);
-    unsafe { std::mem::transmute(offset) }
+    Ok(unsafe {
+        std::mem::transmute::<
+            flatbuffers::WIPOffset<flatbuffers::TableFinishedWIPOffset>,
+            WIPOffset<Table<'b>>,
+        >(offset)
+    })
 }
 
 pub fn decode_signed_response<F>(

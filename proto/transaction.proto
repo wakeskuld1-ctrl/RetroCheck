@@ -18,6 +18,10 @@ service OrderRulesAdmin {
   rpc GetRulesVersion (GetRulesVersionRequest) returns (GetRulesVersionResponse);
 }
 
+service ClusterAdmin {
+  rpc AddHub (AddHubRequest) returns (AddHubResponse);
+}
+
 message ExecuteRequest { string sql = 1; }
 message ExecuteResponse { int32 rows_affected = 1; }
 
@@ -55,3 +59,26 @@ message GetRulesVersionRequest {}
 // - 原因: 需要返回当前规则版本
 // - 目的: 为管理侧提供可观测性
 message GetRulesVersionResponse { uint64 version = 1; }
+
+message AddHubRequest {
+  uint64 node_id = 1;
+  string raft_addr = 2;
+  string grpc_addr = 3;
+  bool auto_promote = 4;
+  string request_id = 5;
+  NodeCompatibility compatibility = 6;
+}
+
+message AddHubResponse {
+  uint64 membership_version = 1;
+  string leader_hint = 2;
+  string reason_code = 3;
+  string suggested_action = 4;
+}
+
+message NodeCompatibility {
+  string app_semver = 1;
+  uint32 sqlite_schema_version = 2;
+  uint32 sled_format_version = 3;
+  uint32 log_codec_version = 4;
+}

@@ -57,6 +57,14 @@ pub struct RaftNode {
     pub state_machine: SqliteStateMachine,
 }
 
+fn build_validated_raft_config(config: Config) -> Result<Arc<Config>> {
+    Ok(Arc::new(
+        config
+            .validate()
+            .map_err(|e| anyhow!("invalid raft config: {e}"))?,
+    ))
+}
+
 #[async_trait]
 impl RaftNetworkTarget for RaftNode {
     async fn append_entries(
@@ -106,7 +114,7 @@ impl RaftNode {
             election_timeout_max: 300,
             ..Default::default()
         };
-        let config = Arc::new(config.validate().unwrap());
+        let config = build_validated_raft_config(config)?;
 
         // 5. 初始化网络
         let network = RaftNetworkFactoryImpl::new(router.clone());
@@ -362,6 +370,17 @@ impl TestCluster {
         Ok(())
     }
 
+    pub async fn write_batch(&self, sqls: Vec<String>) -> Result<usize> {
+        if sqls.is_empty() {
+            return Ok(0);
+        }
+        let leader_id = self.wait_for_leader(None).await?;
+        let leader = self
+            .get_node(leader_id)
+            .ok_or_else(|| anyhow!("Leader not found"))?;
+        leader.apply_sql_batch(sqls).await
+    }
+
     /// ### 修改记录 (2026-02-27)
     /// - 原因: 需要 leader 查询入口
     /// - 目的: 读取一致性数据
@@ -393,20 +412,22 @@ impl TestCluster {
     /// - 原因: 需要模拟 leader 故障
     /// - 目的: 驱动 failover 场景
     pub async fn fail_leader(&mut self) -> Result<()> {
-        // ### 修改记录 (2026-02-27)
-        // - 原因: 需要当前 leader
-        // - 目的: 定位待故障节点
+        self.fail_leader_with_downtime(Duration::from_millis(0))
+            .await
+    }
+
+    pub async fn fail_leader_and_wait_new_leader(&mut self) -> Result<NodeId> {
         let leader_id = self.wait_for_leader(None).await?;
         self.stop_node(leader_id).await?;
-
-        // ### 修改记录 (2026-02-27)
-        // - 原因: 需要等待新 leader
-        // - 目的: 确保 failover 完成
         let _ = self.wait_for_leader(Some(leader_id)).await?;
+        Ok(leader_id)
+    }
 
-        // ### 修改记录 (2026-02-28)
-        // - 原因: 需要恢复故障节点
-        // - 目的: 避免节点耗尽，模拟真实故障恢复
+    pub async fn fail_leader_with_downtime(&mut self, downtime: Duration) -> Result<()> {
+        let leader_id = self.fail_leader_and_wait_new_leader().await?;
+        if !downtime.is_zero() {
+            sleep(downtime).await;
+        }
         self.start_node(leader_id).await?;
 
         Ok(())
@@ -452,5 +473,27 @@ impl TestCluster {
         // - 目的: 确保集群稳定
         let _ = self.wait_for_leader(None).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_validated_raft_config_returns_error_for_invalid_bounds() {
+        let config = Config {
+            heartbeat_interval: 300,
+            election_timeout_min: 500,
+            election_timeout_max: 400,
+            ..Default::default()
+        };
+        let result = std::panic::catch_unwind(|| build_validated_raft_config(config));
+        assert!(result.is_ok());
+        assert!(
+            result
+                .expect("build_validated_raft_config should not panic")
+                .is_err()
+        );
     }
 }

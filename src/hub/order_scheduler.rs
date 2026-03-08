@@ -105,14 +105,14 @@ impl<T> OrderingScheduler<T> {
     // - 备注: 使用 ready_groups 队列轮询就绪组
     pub async fn next_ready(&self) -> Option<ReadyTask<T>> {
         let mut state = self.state.lock().await;
-        
+
         while let Some(group_id) = state.ready_groups.pop_front() {
             let (maybe_task, should_requeue) = {
                 let queue = match state.groups.get_mut(&group_id) {
                     Some(q) => q,
                     None => continue,
                 };
-                
+
                 queue.in_ready_queue = false;
 
                 advance_group_if_needed(queue);
@@ -128,7 +128,7 @@ impl<T> OrderingScheduler<T> {
                         if stage_queue.is_empty() {
                             queue.stages.remove(&stage);
                         }
-                        
+
                         let requeue = if can_schedule(queue, self.stage_parallelism) {
                             queue.in_ready_queue = true;
                             true
@@ -136,11 +136,14 @@ impl<T> OrderingScheduler<T> {
                             false
                         };
 
-                        (Some(ReadyTask {
-                            group: group_id.clone(),
-                            stage,
-                            task,
-                        }), requeue)
+                        (
+                            Some(ReadyTask {
+                                group: group_id.clone(),
+                                stage,
+                                task,
+                            }),
+                            requeue,
+                        )
                     } else {
                         (None, false)
                     }
@@ -165,7 +168,7 @@ impl<T> OrderingScheduler<T> {
     // - 备注: 当前实现通过 inflight 计数确保阶段内收敛
     pub async fn mark_done(&self, group: &str, stage: u32) {
         let mut state = self.state.lock().await;
-        
+
         let should_schedule = {
             let queue = match state.groups.get_mut(group) {
                 Some(q) => q,

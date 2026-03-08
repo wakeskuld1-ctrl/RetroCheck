@@ -1,4 +1,7 @@
-use check_program::hub::edge_schema::{DataRecord, EdgeRequest, decode_request, encode_request};
+use check_program::hub::edge_schema::{
+    DataRecord, EdgeRequest, decode_request, encode_auth_hello, encode_request,
+    encode_signed_response,
+};
 use flatbuffers::FlatBufferBuilder;
 
 #[test]
@@ -42,4 +45,30 @@ fn test_upload_data_encoding() {
     let decoded = decode_request(buf).unwrap();
 
     assert_eq!(decoded, req);
+}
+
+#[test]
+fn test_encode_auth_hello_rejects_non_authhello_request() {
+    let mut builder = FlatBufferBuilder::new();
+    let req = EdgeRequest::Heartbeat {
+        node_id: 7,
+        timestamp: 11,
+    };
+    let res = encode_auth_hello(&mut builder, b"secret", &req);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_encode_signed_response_rejects_invalid_header_prefix() {
+    let mut builder = FlatBufferBuilder::new();
+    let res = encode_signed_response(
+        &mut builder,
+        1,
+        2,
+        3,
+        &[1, 2, 3],
+        b"payload",
+        b"session_key",
+    );
+    assert!(res.is_err());
 }

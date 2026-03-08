@@ -8,7 +8,7 @@ use tokio_util::codec::Framed;
 
 use crate::config::EdgeGatewayConfig;
 use crate::hub::edge_schema::{
-    AuthAck, EdgeRequest, decode_auth_hello, decode_session_request, encode_auth_ack,
+    AuthAck, DataRecord, EdgeRequest, decode_auth_hello, decode_session_request, encode_auth_ack,
     encode_signed_response,
 };
 use crate::hub::order_scheduler::OrderingScheduler;
@@ -211,6 +211,12 @@ mod tests {
     #[tokio::test]
     async fn smart_batcher_stats_successful_write() -> Result<()> {
         let router = Arc::new(Router::new_for_test(true));
+        // ### 修改记录 (2026-03-03)
+        // - 原因: new_for_test 现在使用真实 SQLite
+        // - 目的: 提前建表避免写入失败
+        router
+            .write("CREATE TABLE IF NOT EXISTS t(id INTEGER)".to_string())
+            .await?;
         let config = SmartBatchConfig {
             max_batch_size: 8,
             max_delay_ms: 5,
@@ -238,12 +244,16 @@ mod tests {
                 ordering_stage_parallelism: 2,
                 ordering_queue_limit: 100,
                 batch_shards: 1,
+                pre_agg_enabled: false,
+                pre_agg_queue_size: 1024,
+                edge_client_retry_delay_ms: 100,
+                edge_client_retry_max_attempts: 3,
+                edge_client_retry_exponential_backoff: true,
             },
             order_rules_store,
         )?;
 
-        let result = gateway
-            .batchers[0]
+        let result = gateway.batchers[0]
             .enqueue(vec!["INSERT INTO t VALUES (1)".to_string()], 1)
             .await?;
         assert_eq!(result, 1);
@@ -295,17 +305,24 @@ mod tests {
                 ordering_stage_parallelism: 2,
                 ordering_queue_limit: 100,
                 batch_shards: 1,
+                pre_agg_enabled: false,
+                pre_agg_queue_size: 1024,
+                edge_client_retry_delay_ms: 100,
+                edge_client_retry_max_attempts: 3,
+                edge_client_retry_exponential_backoff: true,
             },
             order_rules_store,
         )?;
 
-        let err = gateway
-            .batchers[0]
+        let err = gateway.batchers[0]
             .enqueue(vec!["INSERT INTO t VALUES (2)".to_string()], 1)
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Batch write not supported on follower"));
+        // ### 修改记录 (2026-03-08)
+        // - 原因: Router.write_batch 已从 follower 直接拒绝改为统一转发流程
+        // - 目的: 断言当前真实错误语义，避免用旧文案导致误报
+        assert!(msg.contains("Not leader and leader address unknown"));
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -327,6 +344,12 @@ mod tests {
     #[tokio::test]
     async fn smart_batcher_stats_wait_timeout_and_drop() -> Result<()> {
         let router = Arc::new(Router::new_for_test(true));
+        // ### 修改记录 (2026-03-03)
+        // - 原因: new_for_test 现在使用真实 SQLite
+        // - 目的: 提前建表避免写入失败
+        router
+            .write("CREATE TABLE IF NOT EXISTS t(id INTEGER)".to_string())
+            .await?;
         let config = SmartBatchConfig {
             max_batch_size: 4,
             max_delay_ms: 60,
@@ -354,12 +377,16 @@ mod tests {
                 ordering_stage_parallelism: 2,
                 ordering_queue_limit: 100,
                 batch_shards: 1,
+                pre_agg_enabled: false,
+                pre_agg_queue_size: 1024,
+                edge_client_retry_delay_ms: 100,
+                edge_client_retry_max_attempts: 3,
+                edge_client_retry_exponential_backoff: true,
             },
             order_rules_store,
         )?;
 
-        let err = gateway
-            .batchers[0]
+        let err = gateway.batchers[0]
             .enqueue(vec!["INSERT INTO t VALUES (3)".to_string()], 1)
             .await
             .unwrap_err();
@@ -403,10 +430,22 @@ mod tests {
         let delta_timing = RequestTimingSnapshot {
             ingress: LatencyBucketsSnapshot::default(),
             batch_wait: LatencyBucketsSnapshot::default(),
+            // ### 修改记录 (2026-03-03)
+            // - 原因: RequestTimingSnapshot 新增落盘分桶
+            // - 目的: 保持测试初始化字段完整
+            write: LatencyBucketsSnapshot::default(),
             response_send: LatencyBucketsSnapshot::default(),
             upload_total: 60,
             upload_errors: 0,
+            // ### 修改记录 (2026-03-03)
+            // - 原因: RequestTimingSnapshot 新增入口与落盘统计
+            // - 目的: 保持测试初始化字段完整
+            ingress_ms_total: 0,
             batch_wait_ms_total: 6000,
+            // ### 修改记录 (2026-03-03)
+            // - 原因: RequestTimingSnapshot 新增落盘耗时总量
+            // - 目的: 保持测试初始化字段完整
+            write_ms_total: 0,
         };
 
         let derived = compute_batcher_derived_metrics(&delta_batcher, &delta_timing);
@@ -446,6 +485,11 @@ mod tests {
                 // - 原因: EdgeGatewayConfig 新增分片字段
                 // - 目的: 保证测试配置覆盖全部必填参数
                 batch_shards: 1,
+                pre_agg_enabled: false,
+                pre_agg_queue_size: 1024,
+                edge_client_retry_delay_ms: 100,
+                edge_client_retry_max_attempts: 3,
+                edge_client_retry_exponential_backoff: true,
             },
             order_rules_store,
         )?;
@@ -453,7 +497,15 @@ mod tests {
         let summary = gateway.timing_summary();
         assert_eq!(summary.upload_total, 0);
         assert_eq!(summary.upload_errors, 0);
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 新增入口耗时统计字段
+        // - 目的: 验证默认值为 0
+        assert_eq!(summary.ingress_ms_total, 0);
         assert_eq!(summary.batch_wait_ms_total, 0);
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 新增落盘耗时统计字段
+        // - 目的: 验证默认值为 0
+        assert_eq!(summary.write_ms_total, 0);
 
         Ok(())
     }
@@ -503,6 +555,11 @@ mod tests {
                 // - 原因: 测试需要显式分片数
                 // - 目的: 触发分片调度路径
                 batch_shards: 4,
+                pre_agg_enabled: false,
+                pre_agg_queue_size: 1024,
+                edge_client_retry_delay_ms: 100,
+                edge_client_retry_max_attempts: 3,
+                edge_client_retry_exponential_backoff: true,
             },
             order_rules_store,
         )?;
@@ -511,6 +568,58 @@ mod tests {
         let idx2 = gateway.shard_index_for_group("group-a");
         assert_eq!(idx1, idx2);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_aggregator_only_created_when_enabled() -> Result<()> {
+        let router = Arc::new(Router::new_for_test(true));
+        let order_rules_store = Arc::new(OrderRulesStore::new());
+        let disabled = EdgeGateway::new(
+            "127.0.0.1:0".to_string(),
+            router.clone(),
+            EdgeGatewayConfig {
+                pre_agg_enabled: false,
+                ..EdgeGatewayConfig::default()
+            },
+            order_rules_store.clone(),
+        )?;
+        assert!(disabled.pre_aggregator.is_none());
+
+        let enabled = EdgeGateway::new(
+            "127.0.0.1:0".to_string(),
+            router,
+            EdgeGatewayConfig {
+                pre_agg_enabled: true,
+                pre_agg_queue_size: 8,
+                ..EdgeGatewayConfig::default()
+            },
+            order_rules_store,
+        )?;
+        assert!(enabled.pre_aggregator.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn ai_downlink_generates_commands_for_actuator_upload() {
+        let records = vec![DataRecord {
+            key: "dev_320_req_1".to_string(),
+            value: vec![1, 2, 3, 4],
+            timestamp: 123456,
+        }];
+        let commands = build_ai_downlink_commands(320, &records);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["target_device_id"], 320);
+    }
+
+    #[test]
+    fn ai_downlink_skips_command_ack_upload() {
+        let records = vec![DataRecord {
+            key: "cmd_ack_cmd-320-123".to_string(),
+            value: vec![1],
+            timestamp: 123456,
+        }];
+        let commands = build_ai_downlink_commands(320, &records);
+        assert!(commands.is_empty());
     }
 }
 
@@ -655,7 +764,7 @@ pub fn pack_signed_response_payload(
     nonce: u64,
     req_header: &Header,
     session_key: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut header_prefix = [0u8; 14];
     header_prefix[0..4].copy_from_slice(&MAGIC);
     header_prefix[4] = VERSION;
@@ -671,9 +780,55 @@ pub fn pack_signed_response_payload(
         &header_prefix,
         payload,
         session_key,
-    );
+    )?;
     builder.finish(root, None);
-    builder.finished_data().to_vec()
+    Ok(builder.finished_data().to_vec())
+}
+
+fn is_command_ack_record_key(key: &str) -> bool {
+    key.starts_with("cmd_ack_")
+}
+
+fn ai_action_for_device(device_id: u64) -> Option<&'static str> {
+    if (300..380).contains(&device_id) {
+        Some("adjust_irrigation")
+    } else if (380..450).contains(&device_id) {
+        Some("adjust_fertilizer")
+    } else if (450..500).contains(&device_id) {
+        Some("dispatch_tractor")
+    } else {
+        None
+    }
+}
+
+fn build_ai_downlink_commands(device_id: u64, records: &[DataRecord]) -> Vec<serde_json::Value> {
+    if records
+        .iter()
+        .any(|record| is_command_ack_record_key(&record.key))
+    {
+        return Vec::new();
+    }
+    let Some(action) = ai_action_for_device(device_id) else {
+        return Vec::new();
+    };
+    records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "cmd_id": format!("cmd-{}-{}", device_id, record.timestamp),
+                "target_device_id": device_id,
+                "action": action,
+                "issued_at": record.timestamp,
+            })
+        })
+        .collect()
+}
+
+fn count_command_ack_records(records: &[DataRecord]) -> u64 {
+    records
+        .iter()
+        .filter(|record| is_command_ack_record_key(&record.key))
+        .count() as u64
 }
 
 // ### 修改记录 (2026-03-01)
@@ -696,6 +851,12 @@ struct OrderingItem {
     resp: oneshot::Sender<Result<usize>>,
 }
 
+struct PreAggItem {
+    sqls: Vec<String>,
+    record_count: usize,
+    resp: oneshot::Sender<Result<usize>>,
+}
+
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要与配置解耦
 // - 目的: 将批处理参数在 EdgeGateway 内部集中管理
@@ -704,6 +865,11 @@ struct SmartBatchConfig {
     max_batch_size: usize,
     max_delay_ms: u64,
     max_queue_size: usize,
+    max_wait_ms: u64,
+}
+
+struct GlobalPreAggregator {
+    senders: Vec<mpsc::Sender<PreAggItem>>,
     max_wait_ms: u64,
 }
 
@@ -768,7 +934,9 @@ impl SmartBatchStatsSnapshot {
                 .saturating_sub(previous.response_dropped),
             enqueue_ok: self.enqueue_ok.saturating_sub(previous.enqueue_ok),
             batch_write_ok: self.batch_write_ok.saturating_sub(previous.batch_write_ok),
-            batch_write_err: self.batch_write_err.saturating_sub(previous.batch_write_err),
+            batch_write_err: self
+                .batch_write_err
+                .saturating_sub(previous.batch_write_err),
             enqueued_total: self.enqueued_total.saturating_sub(previous.enqueued_total),
             batched_sqls_total: self
                 .batched_sqls_total
@@ -877,32 +1045,55 @@ impl LatencyBuckets {
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要按阶段统计 UploadData 延迟
 // - 目的: 定位入口、批处理与回包瓶颈
+// ### 修改记录 (2026-03-02)
+// - 原因: 需要落盘阶段延迟统计
+// - 目的: 以落盘完成作为端到端阶段终点
 #[derive(Debug, Clone, Default)]
 struct RequestTimingSnapshot {
     ingress: LatencyBucketsSnapshot,
     batch_wait: LatencyBucketsSnapshot,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要区分落盘阶段耗时
+    // - 目的: 输出落盘完成时间分布
+    write: LatencyBucketsSnapshot,
     response_send: LatencyBucketsSnapshot,
     upload_total: u64,
     upload_errors: u64,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要统计入口处理的总耗时
+    // - 目的: 计算入口平均耗时
+    ingress_ms_total: u64,
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要计算平均批等待时间
     // - 目的: 通过累计等待毫秒与请求数计算平均值
     batch_wait_ms_total: u64,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要统计落盘写入总耗时
+    // - 目的: 计算落盘平均耗时
+    write_ms_total: u64,
 }
 
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要对外提供轻量级汇总
 // - 目的: 在压测中计算平均等待时间
+// ### 修改记录 (2026-03-02)
+// - 原因: 需要输出入口与落盘汇总
+// - 目的: 支持端到端延迟计算
 #[derive(Debug, Clone, Default)]
 pub struct RequestTimingSummary {
     pub upload_total: u64,
     pub upload_errors: u64,
+    pub ingress_ms_total: u64,
     pub batch_wait_ms_total: u64,
+    pub write_ms_total: u64,
 }
 
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要输出区间增量
 // - 目的: 压测时观察时间窗口内变化
+// ### 修改记录 (2026-03-02)
+// - 原因: 新增落盘阶段统计
+// - 目的: 对齐每秒端到端链路分布
 impl RequestTimingSnapshot {
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要计算区间差值
@@ -911,15 +1102,29 @@ impl RequestTimingSnapshot {
         Self {
             ingress: self.ingress.delta(&previous.ingress),
             batch_wait: self.batch_wait.delta(&previous.batch_wait),
+            // ### 修改记录 (2026-03-02)
+            // - 原因: 需要输出落盘阶段区间差值
+            // - 目的: 观察落盘抖动
+            write: self.write.delta(&previous.write),
             response_send: self.response_send.delta(&previous.response_send),
             upload_total: self.upload_total.saturating_sub(previous.upload_total),
             upload_errors: self.upload_errors.saturating_sub(previous.upload_errors),
+            // ### 修改记录 (2026-03-02)
+            // - 原因: 需要输出区间内的入口耗时总量
+            // - 目的: 计算入口平均耗时
+            ingress_ms_total: self
+                .ingress_ms_total
+                .saturating_sub(previous.ingress_ms_total),
             // ### 修改记录 (2026-03-01)
             // - 原因: 需要输出区间内的等待耗时总量
             // - 目的: 与区间请求数对齐计算平均等待时间
             batch_wait_ms_total: self
                 .batch_wait_ms_total
                 .saturating_sub(previous.batch_wait_ms_total),
+            // ### 修改记录 (2026-03-02)
+            // - 原因: 需要输出区间内的落盘耗时总量
+            // - 目的: 计算落盘平均耗时
+            write_ms_total: self.write_ms_total.saturating_sub(previous.write_ms_total),
         }
     }
 }
@@ -927,17 +1132,32 @@ impl RequestTimingSnapshot {
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要轻量级运行时统计
 // - 目的: 在不影响主流程的前提下收集证据
+// ### 修改记录 (2026-03-02)
+// - 原因: 需要落盘阶段统计
+// - 目的: 支撑端到端落盘耗时计算
 #[derive(Debug, Default)]
 struct RequestTimingStats {
     ingress: LatencyBuckets,
     batch_wait: LatencyBuckets,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要记录落盘阶段延迟
+    // - 目的: 输出落盘耗时分布
+    write: LatencyBuckets,
     response_send: LatencyBuckets,
     upload_total: AtomicU64,
     upload_errors: AtomicU64,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要累计入口耗时
+    // - 目的: 计算入口平均耗时
+    ingress_ms_total: AtomicU64,
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要累计批处理等待耗时
     // - 目的: 计算平均批等待时间
     batch_wait_ms_total: AtomicU64,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要累计落盘耗时
+    // - 目的: 计算落盘平均耗时
+    write_ms_total: AtomicU64,
 }
 
 // ### 修改记录 (2026-03-01)
@@ -947,8 +1167,12 @@ impl RequestTimingStats {
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要统计入口处理耗时
     // - 目的: 评估解析与 SQL 构建成本
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要累计入口耗时总量
+    // - 目的: 输出入口平均耗时
     fn record_ingress_ms(&self, ms: u64) {
         self.ingress.record_ms(ms);
+        self.ingress_ms_total.fetch_add(ms, Ordering::Relaxed);
     }
 
     // ### 修改记录 (2026-03-01)
@@ -960,6 +1184,17 @@ impl RequestTimingStats {
         // - 原因: 需要累计等待时间
         // - 目的: 输出平均批等待时间
         self.batch_wait_ms_total.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要统计落盘阶段耗时
+    // - 目的: 输出落盘完成时间分布
+    fn record_write_ms(&self, ms: u64) {
+        self.write.record_ms(ms);
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 需要累计落盘耗时
+        // - 目的: 输出落盘平均耗时
+        self.write_ms_total.fetch_add(ms, Ordering::Relaxed);
     }
 
     // ### 修改记录 (2026-03-01)
@@ -986,28 +1221,48 @@ impl RequestTimingStats {
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要对外输出快照
     // - 目的: 供定时日志读取
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要输出落盘阶段统计
+    // - 目的: 对齐端到端落盘耗时
     fn snapshot(&self) -> RequestTimingSnapshot {
         RequestTimingSnapshot {
             ingress: self.ingress.snapshot(),
             batch_wait: self.batch_wait.snapshot(),
+            // ### 修改记录 (2026-03-02)
+            // - 原因: 需要输出落盘统计快照
+            // - 目的: 观察落盘耗时分布
+            write: self.write.snapshot(),
             response_send: self.response_send.snapshot(),
             upload_total: self.upload_total.load(Ordering::Relaxed),
             upload_errors: self.upload_errors.load(Ordering::Relaxed),
+            // ### 修改记录 (2026-03-02)
+            // - 原因: 需要对外暴露累计入口耗时
+            // - 目的: 计算入口平均耗时
+            ingress_ms_total: self.ingress_ms_total.load(Ordering::Relaxed),
             // ### 修改记录 (2026-03-01)
             // - 原因: 需要对外暴露累计等待耗时
             // - 目的: 支撑区间平均等待时间计算
             batch_wait_ms_total: self.batch_wait_ms_total.load(Ordering::Relaxed),
+            // ### 修改记录 (2026-03-02)
+            // - 原因: 需要对外暴露累计落盘耗时
+            // - 目的: 计算落盘平均耗时
+            write_ms_total: self.write_ms_total.load(Ordering::Relaxed),
         }
     }
 
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要输出汇总指标
     // - 目的: 压测汇总时计算平均等待时间
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要输出入口与落盘汇总
+    // - 目的: 支持端到端落盘耗时计算
     fn summary(&self) -> RequestTimingSummary {
         RequestTimingSummary {
             upload_total: self.upload_total.load(Ordering::Relaxed),
             upload_errors: self.upload_errors.load(Ordering::Relaxed),
+            ingress_ms_total: self.ingress_ms_total.load(Ordering::Relaxed),
             batch_wait_ms_total: self.batch_wait_ms_total.load(Ordering::Relaxed),
+            write_ms_total: self.write_ms_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -1015,16 +1270,34 @@ impl RequestTimingStats {
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要在日志中输出批处理派生指标
 // - 目的: 提供批次数、平均批大小与平均批等待时间
+// ### 修改记录 (2026-03-02)
+// - 原因: 需要输出入口与落盘派生指标
+// - 目的: 对齐端到端落盘延迟口径
 #[derive(Debug, Clone, Default)]
 struct DerivedBatchMetrics {
     batches: u64,
     avg_batch_size: f64,
     avg_batch_wait_ms: f64,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要统计入口平均耗时
+    // - 目的: 观察解析与 SQL 构造成本
+    avg_ingress_ms: f64,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要统计落盘平均耗时
+    // - 目的: 以落盘完成时间为终点
+    avg_write_ms: f64,
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要输出端到端落盘耗时
+    // - 目的: 汇总入口 + 批处理等待（含写入）
+    avg_persist_ms: f64,
 }
 
 // ### 修改记录 (2026-03-01)
 // - 原因: 需要从区间增量快照计算派生指标
 // - 目的: 避免累计值导致的平均值失真
+// ### 修改记录 (2026-03-02)
+// - 原因: 需要计算端到端落盘平均耗时
+// - 目的: 对齐落盘完成作为终点的口径
 fn compute_batcher_derived_metrics(
     delta_batcher: &SmartBatchStatsSnapshot,
     delta_timing: &RequestTimingSnapshot,
@@ -1040,10 +1313,27 @@ fn compute_batcher_derived_metrics(
     } else {
         delta_timing.batch_wait_ms_total as f64 / delta_timing.upload_total as f64
     };
+    let avg_ingress_ms = if delta_timing.upload_total == 0 {
+        0.0
+    } else {
+        delta_timing.ingress_ms_total as f64 / delta_timing.upload_total as f64
+    };
+    let avg_write_ms = if delta_timing.upload_total == 0 {
+        0.0
+    } else {
+        delta_timing.write_ms_total as f64 / delta_timing.upload_total as f64
+    };
+    // ### 修改记录 (2026-03-02)
+    // - 原因: batch_wait 已包含写入等待
+    // - 目的: 避免双重累计导致端到端耗时偏大
+    let avg_persist_ms = avg_ingress_ms + avg_batch_wait_ms;
     DerivedBatchMetrics {
         batches,
         avg_batch_size,
         avg_batch_wait_ms,
+        avg_ingress_ms,
+        avg_write_ms,
+        avg_persist_ms,
     }
 }
 
@@ -1057,7 +1347,10 @@ fn duration_ms(start: Instant, end: Instant) -> u64 {
 // ### 修改记录 (2026-03-01)
 // - 原因: EdgeGateway 需要 Smart Batcher 组件
 // - 目的: 对 UploadData 进行入口批处理并统一回执扇出
-struct SmartBatcher {
+// ### 修改记录 (2026-03-03)
+// - 原因: 需要消除 clippy 的 private_interfaces 报错
+// - 目的: 保持 batchers 字段对 crate 内测试可用
+pub(crate) struct SmartBatcher {
     sender: mpsc::Sender<SmartBatchItem>,
     max_wait_ms: u64,
     stats: Arc<SmartBatchStats>,
@@ -1067,7 +1360,14 @@ impl SmartBatcher {
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要将入口请求批处理后提交到 Router
     // - 目的: 控制批次大小与延迟，稳定高峰写入
-    fn new(router: Arc<Router>, config: SmartBatchConfig) -> Self {
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要落盘阶段统计
+    // - 目的: 以落盘完成作为端到端终点
+    fn new(
+        router: Arc<Router>,
+        config: SmartBatchConfig,
+        timing_stats: Arc<RequestTimingStats>,
+    ) -> Self {
         let queue_size = config.max_queue_size.max(1);
         let (tx, mut rx) = mpsc::channel::<SmartBatchItem>(queue_size);
         let max_batch_size = config.max_batch_size.max(1);
@@ -1075,6 +1375,10 @@ impl SmartBatcher {
         let max_wait_ms = config.max_wait_ms;
         let stats = Arc::new(SmartBatchStats::default());
         let stats_clone = stats.clone();
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 需要跨协程统计落盘耗时
+        // - 目的: 避免在入口路径上重复计算
+        let timing_stats_clone = timing_stats.clone();
 
         tokio::spawn(async move {
             let mut batch: Vec<SmartBatchItem> = Vec::with_capacity(max_batch_size);
@@ -1131,7 +1435,19 @@ impl SmartBatcher {
                 stats_clone
                     .batched_sqls_total
                     .fetch_add(merged_sqls.len() as u64, Ordering::Relaxed);
+                // ### 修改记录 (2026-03-02)
+                // - 原因: 需要统计落盘耗时
+                // - 目的: 以落盘完成作为端到端终点
+                let write_start = Instant::now();
                 let result = router.write_batch(merged_sqls).await;
+                let write_end = Instant::now();
+                let write_ms = duration_ms(write_start, write_end);
+                // ### 修改记录 (2026-03-02)
+                // - 原因: 需要将落盘耗时归入每条请求
+                // - 目的: 保持统计口径按请求计数
+                for _ in 0..batch.len() {
+                    timing_stats_clone.record_write_ms(write_ms);
+                }
                 match result {
                     Ok(_) => {
                         stats_clone.batch_write_ok.fetch_add(1, Ordering::Relaxed);
@@ -1228,6 +1544,123 @@ impl SmartBatcher {
     }
 }
 
+impl GlobalPreAggregator {
+    fn new(batchers: &[Arc<SmartBatcher>], config: SmartBatchConfig, queue_size: usize) -> Self {
+        let queue_size = queue_size.max(1);
+        let max_batch_size = config.max_batch_size.max(1);
+        let max_delay_ms = config.max_delay_ms;
+        let max_wait_ms = config.max_wait_ms;
+        let mut senders = Vec::with_capacity(batchers.len());
+        for batcher in batchers {
+            let (tx, mut rx) = mpsc::channel::<PreAggItem>(queue_size);
+            let batcher = batcher.clone();
+            tokio::spawn(async move {
+                let mut batch: Vec<PreAggItem> = Vec::with_capacity(max_batch_size);
+                let mut total_sqls: usize = 0;
+                loop {
+                    let first = match rx.recv().await {
+                        Some(item) => item,
+                        None => break,
+                    };
+                    total_sqls += first.sqls.len();
+                    batch.push(first);
+                    let deadline =
+                        tokio::time::Instant::now() + Duration::from_millis(max_delay_ms);
+                    loop {
+                        if total_sqls >= max_batch_size {
+                            break;
+                        }
+                        let timeout = tokio::time::sleep_until(deadline);
+                        tokio::pin!(timeout);
+                        tokio::select! {
+                            _ = timeout => {
+                                break;
+                            }
+                            res = rx.recv() => {
+                                match res {
+                                    Some(item) => {
+                                        total_sqls += item.sqls.len();
+                                        batch.push(item);
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                    if batch.is_empty() {
+                        total_sqls = 0;
+                        continue;
+                    }
+                    let mut merged_sqls: Vec<String> = Vec::with_capacity(total_sqls);
+                    let mut success_counts: Vec<usize> = Vec::with_capacity(batch.len());
+                    for item in &batch {
+                        merged_sqls.extend(item.sqls.clone());
+                        success_counts.push(item.record_count);
+                    }
+                    let result = batcher
+                        .enqueue(merged_sqls, success_counts.iter().sum())
+                        .await;
+                    match result {
+                        Ok(_) => {
+                            for (item, success_count) in
+                                batch.drain(..).zip(success_counts.into_iter())
+                            {
+                                let _ = item.resp.send(Ok(success_count));
+                            }
+                        }
+                        Err(err) => {
+                            let err_msg = err.to_string();
+                            for item in batch.drain(..) {
+                                let _ = item.resp.send(Err(anyhow!(err_msg.clone())));
+                            }
+                        }
+                    }
+                    total_sqls = 0;
+                }
+            });
+            senders.push(tx);
+        }
+        Self {
+            senders,
+            max_wait_ms,
+        }
+    }
+
+    async fn enqueue(
+        &self,
+        shard_index: usize,
+        sqls: Vec<String>,
+        record_count: usize,
+    ) -> Result<usize> {
+        if self.senders.is_empty() {
+            return Err(anyhow!("PreAgg unavailable"));
+        }
+        let index = shard_index % self.senders.len();
+        let (tx, rx) = oneshot::channel();
+        if self.senders[index]
+            .try_send(PreAggItem {
+                sqls,
+                record_count,
+                resp: tx,
+            })
+            .is_err()
+        {
+            return Err(anyhow!("PreAgg queue full"));
+        }
+        if self.max_wait_ms == 0 {
+            match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("PreAgg response dropped")),
+            }
+        } else {
+            match tokio::time::timeout(Duration::from_millis(self.max_wait_ms), rx).await {
+                Ok(inner) => inner.map_err(|_| anyhow!("PreAgg response dropped"))?,
+                Err(_) => Err(anyhow!("PreAgg wait timeout")),
+            }
+        }
+    }
+}
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -1287,7 +1720,11 @@ pub struct EdgeGateway {
     // - 原因: 需要在入口聚合写请求
     // - 目的: 避免每条请求直接打到 Raft
     // - 备注: 使用分片 Batcher 提升并发吞吐
-    pub batchers: Vec<Arc<SmartBatcher>>,
+    // ### 修改记录 (2026-03-03)
+    // - 原因: 限制对外暴露以配合可见性约束
+    // - 目的: 避免 public 字段暴露 crate 内类型
+    pub(crate) batchers: Vec<Arc<SmartBatcher>>,
+    pre_aggregator: Option<Arc<GlobalPreAggregator>>,
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要在网关侧读取顺序规则
     // - 目的: 支持按 device_id + msg_type 做顺序匹配
@@ -1328,6 +1765,10 @@ impl EdgeGateway {
 
         let blacklist = Blacklist::new(5, Duration::from_secs(300), Duration::from_secs(60));
         let concurrency_limit = Arc::new(Semaphore::new(config.max_connections));
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 需要收集运行路径耗时分布
+        // - 目的: 为压测定位提供证据
+        let timing_stats = Arc::new(RequestTimingStats::default());
         // ### 修改记录 (2026-03-01)
         // - 原因: 需要从配置构造 Smart Batcher
         // - 目的: 使批处理参数可调
@@ -1344,6 +1785,7 @@ impl EdgeGateway {
             batchers.push(Arc::new(SmartBatcher::new(
                 router.clone(),
                 batch_config.clone(),
+                timing_stats.clone(),
             )));
         }
 
@@ -1374,11 +1816,15 @@ impl EdgeGateway {
                 spawn_ordering_worker(batcher.clone(), scheduler.clone());
             }
         }
-        // ### 修改记录 (2026-03-01)
-        // - 原因: 需要收集运行路径耗时分布
-        // - 目的: 为压测定位提供证据
-        let timing_stats = Arc::new(RequestTimingStats::default());
-
+        let pre_aggregator = if config.pre_agg_enabled {
+            Some(Arc::new(GlobalPreAggregator::new(
+                &batchers,
+                batch_config.clone(),
+                config.pre_agg_queue_size,
+            )))
+        } else {
+            None
+        };
         Ok(Self {
             addr,
             sessions: Arc::new(Mutex::new(sessions)),
@@ -1388,6 +1834,7 @@ impl EdgeGateway {
             blacklist: Arc::new(Mutex::new(blacklist)),
             concurrency_limit,
             batchers,
+            pre_aggregator,
             order_rules_store,
             ordering_schedulers,
             ordering_wait_timeout_ms: config.batch_wait_timeout_ms,
@@ -1432,14 +1879,20 @@ impl EdgeGateway {
                             Err(_) => continue,
                         };
                     {
-                        let mut sessions = sessions.lock().unwrap();
+                        let mut sessions = match sessions.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
                         let count = sessions.cleanup_expired(now_ms);
                         if count > 0 {
                             println!("GC: cleaned up {} expired sessions", count);
                         }
                     }
                     {
-                        let mut bl = blacklist.lock().unwrap();
+                        let mut bl = match blacklist.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
                         bl.cleanup();
                     }
                 }
@@ -1454,7 +1907,10 @@ impl EdgeGateway {
             // - 原因: 需要跨任务共享统计引用
             // - 目的: 降低日志协程对主流程的影响
             let timing_stats = self.timing_stats.clone();
-            let gateway = self.clone();
+            // ### 修改记录 (2026-03-03)
+            // - 原因: 日志协程不应延长网关生命周期
+            // - 目的: 避免测试中持久化锁无法释放
+            let gateway = Arc::downgrade(&self);
             // ### 修改记录 (2026-03-01)
             // - 原因: 需要按秒观察指标变化
             // - 目的: 与压测 1 秒粒度的发送速率对齐
@@ -1464,12 +1920,24 @@ impl EdgeGateway {
                 // - 原因: 需要输出区间增量
                 // - 目的: 避免累计值难以定位波动
                 let mut last_timing = timing_stats.snapshot();
-                let mut last_batcher = gateway.batcher_stats();
+                // ### 修改记录 (2026-03-03)
+                // - 原因: 弱引用可能已释放
+                // - 目的: 在网关退出后终止日志循环
+                let mut last_batcher = match gateway.upgrade() {
+                    Some(gateway) => gateway.batcher_stats(),
+                    None => return,
+                };
 
                 loop {
                     interval.tick().await;
                     let current_timing = timing_stats.snapshot();
                     let delta_timing = current_timing.delta(&last_timing);
+                    // ### 修改记录 (2026-03-03)
+                    // - 原因: 网关可能已被释放
+                    // - 目的: 避免后台任务持有强引用
+                    let Some(gateway) = gateway.upgrade() else {
+                        break;
+                    };
                     let current_batcher = gateway.batcher_stats();
                     let delta_batcher = current_batcher.delta(&last_batcher);
 
@@ -1478,7 +1946,7 @@ impl EdgeGateway {
                     // - 目的: 快速判断批次规模与平均等待时间
                     let derived = compute_batcher_derived_metrics(&delta_batcher, &delta_timing);
                     println!(
-                        "Timing delta: upload_total={} upload_errors={} ingress_ms=[<1:{} <5:{} <10:{} <50:{} <100:{} <500:{} <1000:{} >=1000:{}] batch_wait_ms=[<1:{} <5:{} <10:{} <50:{} <100:{} <500:{} <1000:{} >=1000:{}] response_send_ms=[<1:{} <5:{} <10:{} <50:{} <100:{} <500:{} <1000:{} >=1000:{}] | Batcher delta: queue_full={} wait_timeout={} response_dropped={} enqueue_ok={} batch_write_ok={} batch_write_err={} enqueued_total={} batched_sqls_total={} batch_wait_ok={} batch_wait_err={} | Derived: batches={} avg_batch_size={:.2} avg_batch_wait_ms={:.2}",
+                        "Timing delta: upload_total={} upload_errors={} ingress_ms=[<1:{} <5:{} <10:{} <50:{} <100:{} <500:{} <1000:{} >=1000:{}] batch_wait_ms=[<1:{} <5:{} <10:{} <50:{} <100:{} <500:{} <1000:{} >=1000:{}] write_ms=[<1:{} <5:{} <10:{} <50:{} <100:{} <500:{} <1000:{} >=1000:{}] response_send_ms=[<1:{} <5:{} <10:{} <50:{} <100:{} <500:{} <1000:{} >=1000:{}] | Batcher delta: queue_full={} wait_timeout={} response_dropped={} enqueue_ok={} batch_write_ok={} batch_write_err={} enqueued_total={} batched_sqls_total={} batch_wait_ok={} batch_wait_err={} | Derived: batches={} avg_batch_size={:.2} avg_ingress_ms={:.2} avg_batch_wait_ms={:.2} avg_write_ms={:.2} avg_persist_ms={:.2}",
                         delta_timing.upload_total,
                         delta_timing.upload_errors,
                         delta_timing.ingress.lt_1ms,
@@ -1497,6 +1965,14 @@ impl EdgeGateway {
                         delta_timing.batch_wait.lt_500ms,
                         delta_timing.batch_wait.lt_1000ms,
                         delta_timing.batch_wait.ge_1000ms,
+                        delta_timing.write.lt_1ms,
+                        delta_timing.write.lt_5ms,
+                        delta_timing.write.lt_10ms,
+                        delta_timing.write.lt_50ms,
+                        delta_timing.write.lt_100ms,
+                        delta_timing.write.lt_500ms,
+                        delta_timing.write.lt_1000ms,
+                        delta_timing.write.ge_1000ms,
                         delta_timing.response_send.lt_1ms,
                         delta_timing.response_send.lt_5ms,
                         delta_timing.response_send.lt_10ms,
@@ -1517,7 +1993,10 @@ impl EdgeGateway {
                         delta_batcher.batch_wait_err,
                         derived.batches,
                         derived.avg_batch_size,
-                        derived.avg_batch_wait_ms
+                        derived.avg_ingress_ms,
+                        derived.avg_batch_wait_ms,
+                        derived.avg_write_ms,
+                        derived.avg_persist_ms
                     );
 
                     last_timing = current_timing;
@@ -1595,7 +2074,11 @@ impl EdgeGateway {
                 };
                 let result = if let Some(rule) = matched_rule {
                     let (tx, rx) = oneshot::channel();
-                    self.ordering_scheduler
+                    // ### 修改记录 (2026-03-02)
+                    // - 原因: 需要顺序域按分片路由调度器
+                    // - 目的: 保持调度分片与批处理分片一致
+                    let shard_index = self.shard_index_for_group(&rule.order_group);
+                    self.ordering_schedulers[shard_index]
                         .enqueue(
                             &rule.order_group,
                             rule.stage,
@@ -1627,7 +2110,20 @@ impl EdgeGateway {
                     // - 原因: 使用分片 Batcher 提升并发吞吐
                     // - 目的: 按设备 ID 分流请求到不同 Batcher
                     let index = (device_id % self.batchers.len() as u64) as usize;
-                    self.batchers[index].enqueue(sqls, record_count).await
+                    if let Some(pre_aggregator) = &self.pre_aggregator {
+                        match pre_aggregator
+                            .enqueue(index, sqls.clone(), record_count)
+                            .await
+                        {
+                            Ok(success_count) => Ok(success_count),
+                            Err(err) if err.to_string().contains("PreAgg queue full") => {
+                                self.batchers[index].enqueue(sqls, record_count).await
+                            }
+                            Err(err) => Err(err),
+                        }
+                    } else {
+                        self.batchers[index].enqueue(sqls, record_count).await
+                    }
                 };
 
                 // ### 修改记录 (2026-03-01)
@@ -1658,9 +2154,18 @@ impl EdgeGateway {
                     }
                 };
 
+                let commands = if success_count > 0 {
+                    build_ai_downlink_commands(device_id, &records)
+                } else {
+                    Vec::new()
+                };
+                let command_ack_received = count_command_ack_records(&records);
                 let response = serde_json::json!({
                     "success": success_count,
                     "failures": failures,
+                    "commands_issued": commands.len(),
+                    "commands": commands,
+                    "command_ack_received": command_ack_received,
                 });
 
                 Ok(serde_json::to_vec(&response)?)
@@ -1673,7 +2178,10 @@ impl EdgeGateway {
         let peer_addr = socket.peer_addr().ok();
 
         if let Some(addr) = peer_addr {
-            let mut bl = self.blacklist.lock().unwrap();
+            let mut bl = match self.blacklist.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             if bl.is_banned(addr.ip()) {
                 // Silently drop connection
                 return Ok(());
@@ -1682,7 +2190,18 @@ impl EdgeGateway {
 
         let mut framed = Framed::new(socket, EdgeFrameCodec);
 
-        while let Some(result) = framed.next().await {
+        loop {
+            let next_frame = tokio::time::timeout(
+                Duration::from_millis(self.ttl_ms.max(1)),
+                framed.next(),
+            )
+            .await;
+            let Some(result) = (match next_frame {
+                Ok(value) => value,
+                Err(_) => break,
+            }) else {
+                break;
+            };
             let (header, payload) = match result {
                 Ok(frame) => frame,
                 Err(e) => {
@@ -1712,8 +2231,14 @@ impl EdgeGateway {
                     let lookup_key = |_id: u64| Some(self.secret_key.clone());
 
                     let auth_result = {
-                        let mut sessions = self.sessions.lock().unwrap();
-                        let mut nonce_cache = self.nonce_cache.lock().unwrap();
+                        let mut sessions = match self.sessions.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let mut nonce_cache = match self.nonce_cache.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
                         let res = handle_auth_hello(
                             &payload,
                             self.ttl_ms,
@@ -1733,7 +2258,10 @@ impl EdgeGateway {
                             if err_msg.contains("signature mismatch")
                                 || err_msg.contains("Invalid AuthHello")
                             {
-                                self.blacklist.lock().unwrap().record_failure(addr.ip());
+                                match self.blacklist.lock() {
+                                    Ok(mut guard) => guard.record_failure(addr.ip()),
+                                    Err(poisoned) => poisoned.into_inner().record_failure(addr.ip()),
+                                }
                             }
                         }
                         res
@@ -1772,8 +2300,14 @@ impl EdgeGateway {
                         .as_millis() as u64;
 
                     let session_result = {
-                        let mut sessions = self.sessions.lock().unwrap();
-                        let mut nonce_cache = self.nonce_cache.lock().unwrap();
+                        let mut sessions = match self.sessions.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let mut nonce_cache = match self.nonce_cache.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
                         let res = handle_session_request(
                             &payload,
                             &mut sessions,
@@ -1791,7 +2325,10 @@ impl EdgeGateway {
                             if err_msg.contains("signature mismatch")
                                 || err_msg.contains("Invalid SessionRequest")
                             {
-                                self.blacklist.lock().unwrap().record_failure(addr.ip());
+                                match self.blacklist.lock() {
+                                    Ok(mut guard) => guard.record_failure(addr.ip()),
+                                    Err(poisoned) => poisoned.into_inner().record_failure(addr.ip()),
+                                }
                             }
                         }
 
@@ -1838,7 +2375,7 @@ impl EdgeGateway {
                         nonce,
                         &header,
                         &session_key,
-                    );
+                    )?;
 
                     let resp_header = Header {
                         version: VERSION,
@@ -1857,8 +2394,10 @@ impl EdgeGateway {
                     // - 原因: 需要标记发送完成时间
                     // - 目的: 记录回包发送耗时分布
                     let response_send_end = Instant::now();
-                    self.timing_stats
-                        .record_response_send_ms(duration_ms(response_send_start, response_send_end));
+                    self.timing_stats.record_response_send_ms(duration_ms(
+                        response_send_start,
+                        response_send_end,
+                    ));
                 }
                 _ => return Err(anyhow!("Unknown msg_type {}", header.msg_type)),
             }

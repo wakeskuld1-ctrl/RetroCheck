@@ -170,6 +170,19 @@ pub struct EdgeGatewayConfig {
     // - 目的: 提升高并发场景下的吞吐量
     #[serde(default = "default_edge_batch_shards")]
     pub batch_shards: usize,
+    #[serde(default = "default_edge_pre_agg_enabled")]
+    pub pre_agg_enabled: bool,
+    #[serde(default = "default_edge_pre_agg_queue_size")]
+    pub pre_agg_queue_size: usize,
+    // ### 修改记录 (2026-03-04)
+    // - 原因: 需要将端到端重试策略配置化
+    // - 目的: 统一控制重试间隔、重试次数与指数退避开关
+    #[serde(default = "default_edge_client_retry_delay_ms")]
+    pub edge_client_retry_delay_ms: u64,
+    #[serde(default = "default_edge_client_retry_max_attempts")]
+    pub edge_client_retry_max_attempts: u32,
+    #[serde(default = "default_edge_client_retry_exponential_backoff")]
+    pub edge_client_retry_exponential_backoff: bool,
 }
 
 fn default_secret_key() -> String {
@@ -182,6 +195,26 @@ fn default_max_connections() -> usize {
 
 fn default_edge_batch_shards() -> usize {
     4
+}
+
+fn default_edge_pre_agg_enabled() -> bool {
+    false
+}
+
+fn default_edge_pre_agg_queue_size() -> usize {
+    50_000
+}
+
+fn default_edge_client_retry_delay_ms() -> u64 {
+    100
+}
+
+fn default_edge_client_retry_max_attempts() -> u32 {
+    3
+}
+
+fn default_edge_client_retry_exponential_backoff() -> bool {
+    true
 }
 
 // ### 修改记录 (2026-03-01)
@@ -245,6 +278,11 @@ impl Default for EdgeGatewayConfig {
             ordering_stage_parallelism: default_edge_ordering_stage_parallelism(),
             ordering_queue_limit: default_edge_ordering_queue_limit(),
             batch_shards: default_edge_batch_shards(),
+            pre_agg_enabled: default_edge_pre_agg_enabled(),
+            pre_agg_queue_size: default_edge_pre_agg_queue_size(),
+            edge_client_retry_delay_ms: default_edge_client_retry_delay_ms(),
+            edge_client_retry_max_attempts: default_edge_client_retry_max_attempts(),
+            edge_client_retry_exponential_backoff: default_edge_client_retry_exponential_backoff(),
         }
     }
 }
@@ -257,6 +295,78 @@ impl EdgeGatewayConfig {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let config: EdgeGatewayConfig = serde_json::from_reader(reader)?;
-        Ok(config)
+        Ok(config.sanitize())
+    }
+
+    fn sanitize(self) -> Self {
+        let default = Self::default();
+        Self {
+            session_ttl_ms: if self.session_ttl_ms == 0 {
+                default.session_ttl_ms
+            } else {
+                self.session_ttl_ms
+            },
+            nonce_cache_limit: if self.nonce_cache_limit == 0 {
+                default.nonce_cache_limit
+            } else {
+                self.nonce_cache_limit
+            },
+            nonce_persist_enabled: self.nonce_persist_enabled,
+            nonce_persist_path: if self.nonce_persist_path.is_empty() {
+                default.nonce_persist_path
+            } else {
+                self.nonce_persist_path
+            },
+            secret_key: if self.secret_key.is_empty() {
+                default.secret_key
+            } else {
+                self.secret_key
+            },
+            max_connections: if self.max_connections == 0 {
+                default.max_connections
+            } else {
+                self.max_connections
+            },
+            batch_max_size: if self.batch_max_size == 0 {
+                default.batch_max_size
+            } else {
+                self.batch_max_size
+            },
+            batch_max_delay_ms: self.batch_max_delay_ms,
+            batch_max_queue_size: if self.batch_max_queue_size == 0 {
+                default.batch_max_queue_size
+            } else {
+                self.batch_max_queue_size
+            },
+            batch_wait_timeout_ms: self.batch_wait_timeout_ms,
+            ordering_stage_parallelism: if self.ordering_stage_parallelism == 0 {
+                default.ordering_stage_parallelism
+            } else {
+                self.ordering_stage_parallelism
+            },
+            ordering_queue_limit: if self.ordering_queue_limit == 0 {
+                default.ordering_queue_limit
+            } else {
+                self.ordering_queue_limit
+            },
+            batch_shards: if self.batch_shards == 0 {
+                default.batch_shards
+            } else {
+                self.batch_shards
+            },
+            pre_agg_enabled: self.pre_agg_enabled,
+            pre_agg_queue_size: if self.pre_agg_queue_size == 0 {
+                default.pre_agg_queue_size
+            } else {
+                self.pre_agg_queue_size
+            },
+            edge_client_retry_delay_ms: self.edge_client_retry_delay_ms,
+            edge_client_retry_max_attempts: if self.edge_client_retry_max_attempts == 0 {
+                default.edge_client_retry_max_attempts
+            } else {
+                self.edge_client_retry_max_attempts
+            },
+            edge_client_retry_exponential_backoff: self.edge_client_retry_exponential_backoff,
+        }
     }
 }
