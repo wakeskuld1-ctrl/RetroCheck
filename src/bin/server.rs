@@ -1,18 +1,28 @@
+use check_program::config::EdgeGatewayConfig;
 use check_program::engine::StorageEngine;
+use check_program::hub::edge_gateway::EdgeGateway;
+use check_program::management::cluster_admin_service::{
+    ClusterAdminService, ClusterBaseline, ClusterNodeManager,
+};
+use check_program::pb::cluster_admin_client::ClusterAdminClient;
+use check_program::management::order_rules_service::{OrderRulesAdminService, OrderRulesStore};
+use check_program::pb::cluster_admin_server::ClusterAdminServer;
 use check_program::pb::database_service_server::{DatabaseService, DatabaseServiceServer};
+use check_program::pb::order_rules_admin_server::OrderRulesAdminServer;
 use check_program::pb::{
-    CommitRequest, CommitResponse, Empty, ExecuteRequest, ExecuteResponse, GetVersionRequest,
-    GetVersionResponse, PrepareRequest, PrepareResponse, RollbackRequest, RollbackResponse,
+    AddHubRequest, CommitRequest, CommitResponse, Empty, ExecuteRequest, ExecuteResponse,
+    GetVersionRequest, GetVersionResponse, NodeCompatibility, PrepareRequest, PrepareResponse,
+    RollbackRequest, RollbackResponse,
 };
 use check_program::raft::router::Router;
+use check_program::raft::{network::RaftRouter, raft_node::RaftNode};
 use clap::Parser;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, transport::Server};
-// ### 修改记录 (2026-02-17)
-// - 原因: 需要在服务启动时初始化 RaftNode
-// - 目的: 让写路径走 RaftNode 封装
 use async_trait::async_trait;
-use check_program::raft::raft_node::RaftNode;
 
 /// Database Server CLI Arguments
 ///
@@ -29,12 +39,39 @@ struct Args {
     /// The path to the database file (e.g., "master.db", "slave1.db").
     /// If it doesn't exist, it will be created.
     #[arg(short, long)]
-    db: String,
+    db: Option<String>,
 
     /// The storage engine to use: "sqlite".
     /// - sqlite: General-purpose OLTP storage.
     #[arg(short, long, default_value = "sqlite")]
     engine: String,
+
+    /// Path to edge gateway config file
+    #[arg(long)]
+    edge_config: Option<String>,
+
+    /// Port for Edge Gateway (TCP)
+    #[arg(long, default_value_t = 8080)]
+    edge_port: u16,
+
+    /// Advertised gRPC address for leader redirect (e.g. http://10.0.0.1:50051)
+    #[arg(long)]
+    advertise_grpc: Option<String>,
+
+    #[arg(long)]
+    addhub: Option<String>,
+
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    admin: String,
+
+    #[arg(long)]
+    node_id: Option<u64>,
+
+    #[arg(long)]
+    raft_addr: Option<String>,
+
+    #[arg(long, default_value_t = true)]
+    auto_promote: bool,
 }
 
 /// ### 修改记录 (2026-02-17)
@@ -63,6 +100,17 @@ impl WriteRouter for Router {
 
     async fn get_version(&self, table: String) -> anyhow::Result<i32> {
         self.get_version(table).await
+    }
+}
+
+#[async_trait]
+impl<R: WriteRouter + ?Sized> WriteRouter for Arc<R> {
+    async fn write(&self, sql: String) -> anyhow::Result<usize> {
+        (**self).write(sql).await
+    }
+
+    async fn get_version(&self, table: String) -> anyhow::Result<i32> {
+        (**self).get_version(table).await
     }
 }
 
@@ -255,11 +303,23 @@ impl DatabaseService for DbServiceImpl {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if let Some(addhub_addr) = args.addhub.clone() {
+        run_addhub_once(args, addhub_addr).await?;
+        return Ok(());
+    }
+    let db_path = args
+        .db
+        .clone()
+        .ok_or("--db is required when running server mode")?;
     let addr = format!("0.0.0.0:{}", args.port).parse()?;
+    let local_grpc_addr = args
+        .advertise_grpc
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", args.port));
 
     println!(
         "Starting server on {} using {} engine for db {}",
-        addr, args.engine, args.db
+        addr, args.engine, db_path
     );
 
     // Factory pattern: Select engine based on CLI argument
@@ -267,28 +327,203 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要将写路径切换到 Router
     // - 目的: 保持协议不变的同时完成内部替换
-    let engine: Arc<dyn StorageEngine> = match args.engine.as_str() {
+    let (engine, router, cluster_admin_service): (
+        Arc<dyn StorageEngine>,
+        Option<Arc<Router>>,
+        Option<ClusterAdminService>,
+    ) = match args.engine.as_str() {
         "sqlite" => {
-            // ### 修改记录 (2026-02-17)
-            // - 原因: 需要引入 RaftNode 写路径
-            // - 目的: 让 Router 写入走 RaftNode
-            let raft_node =
-                RaftNode::start_local(1, std::path::PathBuf::from(args.db.clone())).await?;
-            let router = Router::new_with_raft(raft_node);
-            Arc::new(RouterEngine::new(router))
+            let raft_router = RaftRouter::new();
+            let raft_node = RaftNode::start(1, std::path::PathBuf::from(db_path), raft_router.clone())
+                .await?;
+            raft_router.register(1, Arc::new(raft_node.clone()));
+            let router = Arc::new(Router::new_with_raft(raft_node.clone()));
+            let baseline = ClusterBaseline {
+                app_semver: env!("CARGO_PKG_VERSION").to_string(),
+                sqlite_schema_version: 1,
+                sled_format_version: 1,
+                log_codec_version: 1,
+            };
+            let cluster_manager = Arc::new(ClusterNodeManager::new(
+                1,
+                local_grpc_addr.clone(),
+                Arc::new(raft_node),
+                raft_router,
+                baseline,
+            ));
+            let cluster_admin = ClusterAdminService::new(cluster_manager);
+            (
+                Arc::new(RouterEngine::new(router.clone())),
+                Some(router),
+                Some(cluster_admin),
+            )
         }
         _ => return Err(format!("Unknown engine: {}", args.engine).into()),
     };
 
     let service = DbServiceImpl::new(engine);
+    // ### 修改记录 (2026-03-01)
+    // - 原因: 需要初始化顺序规则管理服务
+    // - 目的: 支持规则热更新与版本查询
+    let order_rules_store = Arc::new(OrderRulesStore::new());
+    let order_rules_service = OrderRulesAdminService::new(order_rules_store.clone());
+
+    // Start Edge Gateway if configured
+    // ### 修改记录 (2026-03-01)
+    // - 原因: clippy 提示可合并条件判断
+    // - 目的: 保持网关启动逻辑不变
+    if let Some(router) = router
+        && let Some(config_path) = args.edge_config
+    {
+        let config = EdgeGatewayConfig::load_from_file(Path::new(&config_path))?;
+        let edge_addr = format!("0.0.0.0:{}", args.edge_port);
+        // ### 修改记录 (2026-03-01)
+        // - 原因: 需要将规则存储注入网关侧
+        // - 目的: 让网关读取热更新后的顺序规则
+        let gateway = EdgeGateway::new(edge_addr, router, config, order_rules_store.clone())?;
+        tokio::spawn(async move {
+            if let Err(e) = Arc::new(gateway).run().await {
+                eprintln!("EdgeGateway error: {:?}", e);
+            }
+        });
+    }
 
     // Start serving requests
-    Server::builder()
-        .add_service(DatabaseServiceServer::new(service))
-        .serve(addr)
-        .await?;
+    let mut builder = Server::builder()
+        .add_service(OrderRulesAdminServer::new(order_rules_service))
+        .add_service(DatabaseServiceServer::new(service));
+
+    if let Some(cluster_admin_service) = cluster_admin_service {
+        builder = builder.add_service(ClusterAdminServer::new(cluster_admin_service));
+    }
+
+    builder.serve(addr).await?;
 
     Ok(())
+}
+
+async fn run_addhub_once(args: Args, addhub_addr: String) -> Result<(), Box<dyn std::error::Error>> {
+    let grpc_addr = normalize_http_addr(&addhub_addr);
+    let raft_addr = args
+        .raft_addr
+        .unwrap_or_else(|| strip_http_prefix(&addhub_addr));
+    let node_id = args.node_id.unwrap_or_else(|| derive_node_id(&grpc_addr));
+    let request_id = format!(
+        "cli-addhub-{}-{}",
+        node_id,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+    );
+    let request = AddHubRequest {
+        node_id,
+        raft_addr,
+        grpc_addr: grpc_addr.clone(),
+        auto_promote: args.auto_promote,
+        request_id,
+        compatibility: Some(NodeCompatibility {
+            app_semver: env!("CARGO_PKG_VERSION").to_string(),
+            sqlite_schema_version: 1,
+            sled_format_version: 1,
+            log_codec_version: 1,
+        }),
+    };
+
+    let mut admin_endpoint = normalize_http_addr(&args.admin);
+    let mut client = ClusterAdminClient::connect(admin_endpoint.clone()).await?;
+    let mut response = client.add_hub(Request::new(request.clone())).await?.into_inner();
+    if response.reason_code == "NOT_LEADER" && response.leader_hint.starts_with("http") {
+        admin_endpoint = response.leader_hint.clone();
+        client = ClusterAdminClient::connect(admin_endpoint.clone()).await?;
+        response = client.add_hub(Request::new(request)).await?.into_inner();
+    }
+
+    if response.reason_code.is_empty() {
+        println!(
+            "ADD_HUB_OK membership_version={} node_id={} grpc_addr={} admin={}",
+            response.membership_version, node_id, grpc_addr, admin_endpoint
+        );
+        return Ok(());
+    }
+
+    let category = classify_addhub_reason_code(&response.reason_code);
+    let detail = format_addhub_failure_detail(&response);
+    println!(
+        "ADD_HUB_FAIL reason_code={} category={} suggested_action={} leader_hint={} detail={}",
+        response.reason_code, category, response.suggested_action, response.leader_hint, detail
+    );
+    Err(
+        format!(
+            "add_hub failed: code={}, category={}, detail={}",
+            response.reason_code, category, detail
+        )
+        .into(),
+    )
+}
+
+fn normalize_http_addr(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    }
+}
+
+fn strip_http_prefix(addr: &str) -> String {
+    addr.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string()
+}
+
+fn derive_node_id(addr: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    addr.hash(&mut hasher);
+    let hashed = hasher.finish();
+    if hashed == 0 {
+        1
+    } else {
+        hashed
+    }
+}
+
+fn classify_addhub_reason_code(reason_code: &str) -> &'static str {
+    match reason_code {
+        "NOT_LEADER" => "LEADER_REDIRECT",
+        "INVALID_ARGUMENT" => "REQUEST_INVALID",
+        "NODE_ID_ALREADY_EXISTS" => "NODE_CONFLICT",
+        "INCOMPATIBLE_APP_VERSION"
+        | "INCOMPATIBLE_SQLITE_SCHEMA"
+        | "INCOMPATIBLE_SLED_FORMAT"
+        | "INCOMPATIBLE_LOG_CODEC" => "VERSION_INCOMPATIBLE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn format_addhub_failure_detail(response: &check_program::pb::AddHubResponse) -> String {
+    match response.reason_code.as_str() {
+        "INCOMPATIBLE_APP_VERSION" => {
+            "应用版本不一致，需统一 app_semver 后再重试".to_string()
+        }
+        "INCOMPATIBLE_SQLITE_SCHEMA" => {
+            "SQLite schema 版本不一致，需先完成迁移再加点".to_string()
+        }
+        "INCOMPATIBLE_SLED_FORMAT" => {
+            "sled 数据格式不一致，需升级或转换存储格式".to_string()
+        }
+        "INCOMPATIBLE_LOG_CODEC" => {
+            "Raft 日志编码版本不一致，需切换到集群一致编码".to_string()
+        }
+        "NOT_LEADER" => {
+            if response.leader_hint.is_empty() {
+                "请求命中 follower，且暂未获取 leader 地址".to_string()
+            } else {
+                "请求命中 follower，需要转发到 leader_hint".to_string()
+            }
+        }
+        "NODE_ID_ALREADY_EXISTS" => "node_id 已存在，请更换 node_id 或复用 request_id".to_string(),
+        "INVALID_ARGUMENT" => "请求参数非法，请按 suggested_action 修正".to_string(),
+        _ => "未知错误，请结合 reason_code 与 suggested_action 排查".to_string(),
+    }
 }
 
 // ### 修改记录 (2026-02-17)
@@ -297,6 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use check_program::pb::AddHubResponse;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -329,5 +565,24 @@ mod tests {
         };
         let _ = service.execute(Request::new(req)).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn classify_reason_code_version_incompatible() {
+        assert_eq!(
+            classify_addhub_reason_code("INCOMPATIBLE_SQLITE_SCHEMA"),
+            "VERSION_INCOMPATIBLE"
+        );
+    }
+
+    #[test]
+    fn format_reason_detail_for_version_error() {
+        let response = AddHubResponse {
+            membership_version: 0,
+            leader_hint: String::new(),
+            reason_code: "INCOMPATIBLE_APP_VERSION".to_string(),
+            suggested_action: "upgrade or downgrade".to_string(),
+        };
+        assert!(format_addhub_failure_detail(&response).contains("应用版本不一致"));
     }
 }

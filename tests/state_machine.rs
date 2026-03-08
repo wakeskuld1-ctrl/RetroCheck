@@ -164,3 +164,38 @@ async fn last_write_at_uses_sqlite_time() {
 
     assert!(v2 >= v1);
 }
+
+#[tokio::test]
+async fn sqlite_pragma_wal_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("node.db");
+
+    let sm = check_program::raft::state_machine::SqliteStateMachine::new(
+        db_path.to_string_lossy().to_string(),
+    )
+    .unwrap();
+
+    let mode = sm
+        .query_scalar("PRAGMA journal_mode;".to_string())
+        .await
+        .unwrap()
+        .to_lowercase();
+    assert_eq!(mode, "wal");
+}
+
+#[tokio::test]
+async fn sqlite_pragma_busy_timeout_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("node.db");
+
+    let sm = check_program::raft::state_machine::SqliteStateMachine::new(
+        db_path.to_string_lossy().to_string(),
+    )
+    .unwrap();
+
+    let timeout = sm
+        .query_scalar("PRAGMA busy_timeout;".to_string())
+        .await
+        .unwrap();
+    assert_eq!(timeout, "5000");
+}

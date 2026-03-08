@@ -249,9 +249,10 @@ async fn setup_test_node() -> (tempfile::TempDir, check_program::raft::raft_node
     let dir = tempfile::tempdir().unwrap();
     let node_id = 1;
     let base_dir = dir.path().to_path_buf();
-    let raft_node = check_program::raft::raft_node::RaftNode::start_local(node_id, base_dir.clone())
-        .await
-        .unwrap();
+    let raft_node =
+        check_program::raft::raft_node::RaftNode::start_local(node_id, base_dir.clone())
+            .await
+            .unwrap();
 
     // Initialize Raft cluster
     let mut members = std::collections::BTreeSet::new();

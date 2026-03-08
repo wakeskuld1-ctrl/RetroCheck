@@ -29,6 +29,11 @@ tonic = "0.14.4"
 tonic-prost = "0.14.4"
 uuid = { version = "1.20.0", features = ["v4"] }
 flatbuffers = "25.12.19"
+hmac = "0.12.1"
+sha2 = "0.10.9"
+crc32fast = "1.4.2"
+tokio-util = { version = "0.7.18", features = ["codec"] }
+bytes = "1.11.1"
 
 [build-dependencies]
 tonic-build = "0.14.4"

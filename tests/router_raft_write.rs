@@ -23,7 +23,7 @@ async fn router_write_uses_raft_log() {
     let mut members = std::collections::BTreeSet::new();
     members.insert(1);
     raft_node.raft.initialize(members).await.unwrap();
-    
+
     // 等待成为 Leader
     loop {
         let metrics = raft_node.raft.metrics().borrow().clone();

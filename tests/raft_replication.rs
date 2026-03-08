@@ -4,10 +4,10 @@
 
 use check_program::raft::network::RaftRouter;
 use check_program::raft::raft_node::RaftNode;
-use uuid::Uuid;
+use openraft::BasicNode;
 use std::sync::Arc;
 use std::time::Duration;
-use openraft::BasicNode;
+use uuid::Uuid;
 
 /// ### 修改记录 (2026-02-17)
 /// - 原因: 需要验证 follower 能应用 leader 写入
@@ -28,8 +28,12 @@ async fn raft_replication_to_follower() {
     let router = RaftRouter::new();
 
     // Start nodes with shared router
-    let leader = RaftNode::start(1, base_dir_leader, router.clone()).await.unwrap();
-    let follower = RaftNode::start(2, base_dir_follower, router.clone()).await.unwrap();
+    let leader = RaftNode::start(1, base_dir_leader, router.clone())
+        .await
+        .unwrap();
+    let follower = RaftNode::start(2, base_dir_follower, router.clone())
+        .await
+        .unwrap();
 
     // Register nodes
     router.register(1, Arc::new(leader.clone()));
@@ -49,9 +53,17 @@ async fn raft_replication_to_follower() {
     }
 
     // Add follower as learner
-    leader.raft.add_learner(2, BasicNode::new("127.0.0.1:0"), true).await.unwrap();
+    leader
+        .raft
+        .add_learner(2, BasicNode::new("127.0.0.1:0"), true)
+        .await
+        .unwrap();
     // Add follower as voter
-    leader.raft.change_membership(std::collections::BTreeSet::from([1, 2]), true).await.unwrap();
+    leader
+        .raft
+        .change_membership(std::collections::BTreeSet::from([1, 2]), true)
+        .await
+        .unwrap();
 
     // Wait for follower to become Follower
     loop {
@@ -64,8 +76,14 @@ async fn raft_replication_to_follower() {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要在 follower 上应用写入
     // - 目的: 验证复制后数据落地
-    leader.apply_sql_for_test("CREATE TABLE IF NOT EXISTS t(x INT)".to_string()).await.unwrap();
-    leader.apply_sql_for_test("INSERT INTO t(x) VALUES (1)".to_string()).await.unwrap();
+    leader
+        .apply_sql_for_test("CREATE TABLE IF NOT EXISTS t(x INT)".to_string())
+        .await
+        .unwrap();
+    leader
+        .apply_sql_for_test("INSERT INTO t(x) VALUES (1)".to_string())
+        .await
+        .unwrap();
 
     // Verify on follower
     // We need to wait for replication to apply to state machine
@@ -73,14 +91,19 @@ async fn raft_replication_to_follower() {
     // Using a simple retry loop for query result consistency
     let mut value = "0".to_string();
     for _ in 0..50 {
-         let res = follower.query_scalar_for_test("SELECT COUNT(*) FROM t".to_string()).await;
-         if let Ok(v) = res {
-             if v == "1" {
-                 value = v;
-                 break;
-             }
-         }
-         tokio::time::sleep(Duration::from_millis(100)).await;
+        let res = follower
+            .query_scalar_for_test("SELECT COUNT(*) FROM t".to_string())
+            .await;
+        // ### 修改记录 (2026-03-01)
+        // - 原因: clippy 提示可合并条件判断
+        // - 目的: 保持一致性检查逻辑不变
+        if let Ok(v) = res
+            && v == "1"
+        {
+            value = v;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     assert_eq!(value, "1");

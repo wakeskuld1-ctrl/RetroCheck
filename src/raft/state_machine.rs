@@ -238,7 +238,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                             // 我们需要定义 WriteBatch 的 Response 语义
                             // 暂时将整个批次视为产生一个 Response
                             // 值为所有受影响行数的逗号分隔字符串
-                            entry_map.push(Some((start_idx, end_idx))); 
+                            entry_map.push(Some((start_idx, end_idx)));
                         }
                         Request::Read { sql: _ } => {
                             // Read requests in log are ignored for state modification
@@ -330,7 +330,7 @@ impl RaftStateMachine<TypeConfig> for SqliteStateMachine {
                             value: Some(total_affected.to_string()),
                         });
                     } else {
-                         responses.push(Response { value: None });
+                        responses.push(Response { value: None });
                     }
                 }
                 None => {

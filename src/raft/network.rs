@@ -20,7 +20,14 @@ use openraft::raft::{
 };
 use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 /// ### 修改记录 (2026-02-26)
 /// - 原因: 解耦 Raft 实例与网络层
@@ -57,7 +64,7 @@ impl RaftRouter {
     }
 
     pub fn register(&self, node_id: NodeId, target: Arc<dyn RaftNetworkTarget>) {
-        let mut targets = self.targets.lock().unwrap();
+        let mut targets = lock_or_recover(&self.targets);
         targets.insert(node_id, target);
     }
 
@@ -70,7 +77,7 @@ impl RaftRouter {
         RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>,
     > {
         let target_node = {
-            let targets = self.targets.lock().unwrap();
+            let targets = lock_or_recover(&self.targets);
             targets.get(&target).cloned()
         };
 
@@ -99,7 +106,7 @@ impl RaftRouter {
         >,
     > {
         let target_node = {
-            let targets = self.targets.lock().unwrap();
+            let targets = lock_or_recover(&self.targets);
             targets.get(&target).cloned()
         };
 
@@ -124,7 +131,7 @@ impl RaftRouter {
         RPCError<NodeId, <TypeConfig as openraft::RaftTypeConfig>::Node, RaftError<NodeId>>,
     > {
         let target_node = {
-            let targets = self.targets.lock().unwrap();
+            let targets = lock_or_recover(&self.targets);
             targets.get(&target).cloned()
         };
 
@@ -229,7 +236,7 @@ impl TestNetwork {
     /// - 原因: 需要注册节点
     /// - 目的: 允许测试选择目标节点
     pub fn register_node(&self, node: RaftNode) {
-        let mut nodes = self.nodes.lock().unwrap();
+        let mut nodes = lock_or_recover(&self.nodes);
         nodes.insert(node.node_id(), node);
     }
 
@@ -238,7 +245,7 @@ impl TestNetwork {
     /// - 目的: 让 follower 应用 SQL
     pub async fn replicate_sql_for_test(&self, target: NodeId, sql: String) -> Result<usize> {
         let node = {
-            let nodes = self.nodes.lock().unwrap();
+            let nodes = lock_or_recover(&self.nodes);
             nodes.get(&target).cloned()
         };
         let node = node.ok_or_else(|| anyhow::anyhow!("Target node not found"))?;
@@ -249,7 +256,7 @@ impl TestNetwork {
     /// - 原因: 需要读取节点
     /// - 目的: 用于测试查询
     pub fn get_node_for_test(&self, node_id: NodeId) -> Option<RaftNode> {
-        let nodes = self.nodes.lock().unwrap();
+        let nodes = lock_or_recover(&self.nodes);
         nodes.get(&node_id).cloned()
     }
 }
@@ -257,5 +264,61 @@ impl TestNetwork {
 impl Default for TestNetwork {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopTarget;
+
+    #[async_trait]
+    impl RaftNetworkTarget for NoopTarget {
+        async fn append_entries(
+            &self,
+            _req: AppendEntriesRequest<TypeConfig>,
+        ) -> Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>> {
+            Err(RaftError::Fatal(Fatal::Panicked))
+        }
+
+        async fn install_snapshot(
+            &self,
+            _req: InstallSnapshotRequest<TypeConfig>,
+        ) -> Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>> {
+            Err(RaftError::Fatal(Fatal::Panicked))
+        }
+
+        async fn vote(
+            &self,
+            _req: VoteRequest<NodeId>,
+        ) -> Result<VoteResponse<NodeId>, RaftError<NodeId>> {
+            Err(RaftError::Fatal(Fatal::Panicked))
+        }
+    }
+
+    #[test]
+    fn raft_router_register_does_not_panic_when_mutex_poisoned() {
+        let router = RaftRouter::new();
+        let poison_router = router.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_router.targets.lock().unwrap();
+            panic!("poison router targets");
+        });
+        let result = std::panic::catch_unwind(|| router.register(1, Arc::new(NoopTarget)));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_network_get_node_does_not_panic_when_mutex_poisoned() {
+        let network = TestNetwork::new();
+        let poison_network = network.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_network.nodes.lock().unwrap();
+            panic!("poison test network nodes");
+        });
+        let result = std::panic::catch_unwind(|| network.get_node_for_test(1));
+        assert!(result.is_ok());
+        assert!(result.expect("get_node_for_test should not panic").is_none());
     }
 }

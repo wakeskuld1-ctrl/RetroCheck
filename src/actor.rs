@@ -148,6 +148,25 @@ impl DbHandle {
             let wal_res = WalLogger::new(&format!("{}.wal", path));
 
             if let (Ok(conn), Ok(wal)) = (conn_res, wal_res) {
+                if let Err(err) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+                    eprintln!(
+                        "Failed to set PRAGMA journal_mode=WAL for {}: {}",
+                        path, err
+                    );
+                    return;
+                }
+                if let Err(err) = conn.execute_batch("PRAGMA synchronous=NORMAL;") {
+                    eprintln!(
+                        "Failed to set PRAGMA synchronous=NORMAL for {}: {}",
+                        path, err
+                    );
+                }
+                if let Err(err) = conn.execute_batch("PRAGMA busy_timeout=5000;") {
+                    eprintln!(
+                        "Failed to set PRAGMA busy_timeout=5000 for {}: {}",
+                        path, err
+                    );
+                }
                 // Initialize actor state
                 let mut actor = DbActor {
                     conn,

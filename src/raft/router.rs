@@ -4,15 +4,16 @@
 
 use crate::pb::database_service_client::DatabaseServiceClient;
 use crate::pb::{ExecuteRequest, GetVersionRequest};
-use crate::raft::raft_node::RaftNode;
+use crate::raft::raft_node::{RaftNode, TestCluster};
 use crate::raft::state_machine::SqliteStateMachine;
 use anyhow::{Result, anyhow};
+use openraft::ServerState;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 #[derive(Clone)]
 pub struct BatchConfig {
@@ -41,30 +42,30 @@ impl BatchWriter {
         let (tx, mut rx) = mpsc::channel::<BatchItem>(queue_size);
         let max_batch_size = config.max_batch_size;
         let max_delay_ms = config.max_delay_ms;
-        
+
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(max_batch_size);
-            
+
             loop {
                 // 1. 获取第一个元素 (如果通道关闭则退出)
                 let first = match rx.recv().await {
                     Some(item) => item,
                     None => break,
                 };
-                
+
                 batch.push(first);
-                
+
                 // 2. 尝试收集更多元素，直到超时或达到最大批次
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(max_delay_ms);
-                
+
                 loop {
                     if batch.len() >= max_batch_size {
                         break;
                     }
-                    
+
                     let timeout = tokio::time::sleep_until(deadline);
                     tokio::pin!(timeout);
-                    
+
                     tokio::select! {
                         _ = timeout => {
                             break;
@@ -77,7 +78,7 @@ impl BatchWriter {
                         }
                     }
                 }
-                
+
                 // 3. 过滤已取消的请求
                 let mut active_items = Vec::with_capacity(batch.len());
                 for item in batch.drain(..) {
@@ -87,11 +88,11 @@ impl BatchWriter {
                         active_items.push(item);
                     }
                 }
-                
+
                 if active_items.is_empty() {
                     continue;
                 }
-                
+
                 // 4. 提交给 RaftNode
                 let sqls: Vec<String> = active_items.iter().map(|item| item.sql.clone()).collect();
                 // 批次大小用于返回结果 (目前 Raft 响应只是受影响行数，这里简化处理)
@@ -102,7 +103,7 @@ impl BatchWriter {
                         // 由于 apply_sql_batch 返回的是批次大小
                         // 我们给每个请求返回 1 表示成功
                         for item in active_items {
-                             let _ = item.resp.send(Ok(1));
+                            let _ = item.resp.send(Ok(1));
                         }
                     }
                     Err(e) => {
@@ -114,7 +115,7 @@ impl BatchWriter {
                 }
             }
         });
-        
+
         Self { sender: tx }
     }
 
@@ -167,21 +168,76 @@ pub struct Router {
     forward_timeout_ms: Option<u64>,
     batcher: Option<BatchWriter>,
     batch_max_wait_ms: Option<u64>,
+    test_cluster: Option<Arc<Mutex<TestCluster>>>,
 }
 
 impl Router {
+    fn is_raft_leader(&self) -> bool {
+        if let Some(raft_node) = &self.raft_node {
+            let metrics_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                raft_node.raft.metrics().borrow().clone()
+            }));
+            if let Ok(metrics) = metrics_result {
+                return metrics.state == ServerState::Leader
+                    && matches!(metrics.current_leader, Some(id) if id == raft_node.node_id());
+            }
+            return false;
+        }
+        self.is_leader
+    }
+
+    async fn forward_write_to_leader(&self, sql: String) -> Result<usize> {
+        let leader_addr = self
+            .leader_addr
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not leader and leader address unknown"))?;
+        let mut client = DatabaseServiceClient::connect(leader_addr.clone())
+            .await
+            .map_err(|e| anyhow!("Leader connect failed: {}", e))?;
+        let req = ExecuteRequest { sql };
+        let timeout_ms = self.forward_timeout_ms.unwrap_or(2000);
+        let res = tokio::time::timeout(Duration::from_millis(timeout_ms), client.execute(req))
+            .await
+            .map_err(|_| anyhow!("Leader forward timeout"))?;
+        let resp = res.map_err(|e| anyhow!("Leader execute failed: {}", e))?;
+        Ok(resp.into_inner().rows_affected as usize)
+    }
+
     /// ### 修改记录 (2026-02-17)
     /// - 原因: 测试需要构造最小 Router
     /// - 目的: 避免依赖真实 Raft 实例
     pub fn new_for_test(is_leader: bool) -> Self {
+        // ### 修改记录 (2026-03-03)
+        // - 原因: 测试需要可写的状态机
+        // - 目的: 保证 write_batch 能返回非 0 结果
+        // - 备注: 使用临时路径避免污染本地文件
+        let state_machine = if is_leader {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let mut path = std::env::temp_dir();
+            path.push(format!("check_program_test_{}.db", suffix));
+            let path_str = path.to_string_lossy().to_string();
+            // ### 修改记录 (2026-03-03)
+            // - 原因: 需要确保测试立刻失败而非静默返回 0
+            // - 目的: 对齐 new_for_test 的可写预期
+            Some(
+                SqliteStateMachine::new(path_str)
+                    .expect("new_for_test requires sqlite state machine"),
+            )
+        } else {
+            None
+        };
         Self {
             is_leader,
-            state_machine: None,
+            state_machine,
             raft_node: None,
             leader_addr: None,
             forward_timeout_ms: None,
             batcher: None,
             batch_max_wait_ms: None,
+            test_cluster: None,
         }
     }
 
@@ -195,17 +251,17 @@ impl Router {
     /// - 原因: 非 Leader 需要转发到 Leader
     /// - 目的: 统一由 Router 承担转发职责
     pub async fn write(&self, sql: String) -> Result<usize> {
-        if self.is_leader {
+        if let Some(cluster) = &self.test_cluster {
+            let guard = cluster.lock().await;
+            guard.write(sql).await?;
+            return Ok(1);
+        }
+        let is_leader = self.is_raft_leader();
+        if is_leader {
             if let Some(batcher) = &self.batcher {
-                // ### 修改记录 (2026-02-28)
-                // - 原因: Smart Batcher 需要接管写请求
-                // - 目的: 将单条写入聚合为批次
                 let wait_ms = self.batch_max_wait_ms.unwrap_or(0);
                 batcher.enqueue(sql, wait_ms).await
             } else if let Some(raft_node) = &self.raft_node {
-                // ### 修改记录 (2026-02-17)
-                // - 原因: 需要优先走 Raft 写路径
-                // - 目的: 避免状态机直写造成分叉
                 raft_node.apply_sql(sql).await
             } else if let Some(state_machine) = &self.state_machine {
                 state_machine.apply_write(sql).await
@@ -213,45 +269,38 @@ impl Router {
                 Ok(0)
             }
         } else {
-            // ### 修改记录 (2026-02-25)
-            // - 原因: 非 Leader 写入需要转发
-            // - 目的: 让客户端保持相同写语义
-            if let Some(leader_addr) = &self.leader_addr {
-                // ### 修改记录 (2026-02-25)
-                // - 原因: 需要动态连接 Leader
-                // - 目的: 避免长连接管理复杂度
-                let mut client = DatabaseServiceClient::connect(leader_addr.clone())
-                    .await
-                    .map_err(|e| anyhow!("Leader connect failed: {}", e))?;
-                // ### 修改记录 (2026-02-25)
-                // - 原因: 需要透传 SQL 写请求
-                // - 目的: 保持与对外 Execute 接口一致
-                let req = ExecuteRequest { sql };
-                // ### 修改记录 (2026-02-25)
-                // - 原因: 需要控制转发等待时间
-                // - 目的: 防止转发阻塞调用方
-                let timeout_ms = self.forward_timeout_ms.unwrap_or(2000);
-                let res =
-                    tokio::time::timeout(Duration::from_millis(timeout_ms), client.execute(req))
-                        .await
-                        .map_err(|_| anyhow!("Leader forward timeout"))?;
-                // ### 修改记录 (2026-02-25)
-                // - 原因: 需要将 gRPC 结果映射为 Router 结果
-                // - 目的: 统一错误风格与返回值
-                // ### 修改记录 (2026-02-25)
-                // - 原因: 需要保留原始错误信息
-                // - 目的: 便于排障与问题定位
-                // ### 修改记录 (2026-02-26)
-                // - 原因: 审计建议保留 gRPC 错误细节
-                // - 目的: 锁定错误透传行为以增强诊断
-                let resp = res.map_err(|e| anyhow!("Leader execute failed: {}", e))?;
-                Ok(resp.into_inner().rows_affected as usize)
+            self.forward_write_to_leader(sql).await
+        }
+    }
+
+    /// ### 修改记录 (2026-03-01)
+    /// - 原因: EdgeGateway Smart Batcher 需要批量写入接口
+    /// - 目的: 将一批 SQL 作为一个写入单元提交
+    pub async fn write_batch(&self, sqls: Vec<String>) -> Result<usize> {
+        if sqls.is_empty() {
+            return Ok(0);
+        }
+        if let Some(cluster) = &self.test_cluster {
+            let guard = cluster.lock().await;
+            return guard.write_batch(sqls).await;
+        }
+
+        let is_leader = self.is_raft_leader();
+        if is_leader {
+            if let Some(raft_node) = &self.raft_node {
+                raft_node.apply_sql_batch(sqls).await
+            } else if let Some(state_machine) = &self.state_machine {
+                let results = state_machine.apply_batch(sqls).await?;
+                Ok(results.len())
             } else {
-                // ### 修改记录 (2026-02-25)
-                // - 原因: 缺少 Leader 地址无法转发
-                // - 目的: 返回明确错误便于上层处理
-                Err(anyhow!("Not leader and leader address unknown"))
+                Ok(0)
             }
+        } else {
+            let mut total_rows = 0usize;
+            for sql in sqls {
+                total_rows = total_rows.saturating_add(self.forward_write_to_leader(sql).await?);
+            }
+            Ok(total_rows)
         }
     }
 
@@ -259,9 +308,14 @@ impl Router {
     /// - 原因: 需要提供最小读路径
     /// - 目的: 支持一致性校验读取
     pub async fn get_version(&self, table: String) -> Result<i32> {
-        if self.is_leader {
+        let is_leader = self.is_raft_leader();
+        if is_leader {
             if let Some(state_machine) = &self.state_machine {
                 state_machine.get_max_version(table).await
+            } else if let Some(raft_node) = &self.raft_node {
+                let sql = format!("SELECT MAX(version) FROM {}", table);
+                let value = raft_node.query_scalar(sql).await?;
+                Ok(value.parse::<i32>().unwrap_or(0))
             } else {
                 Ok(0)
             }
@@ -307,6 +361,7 @@ impl Router {
             forward_timeout_ms: None,
             batcher: None,
             batch_max_wait_ms: None,
+            test_cluster: None,
         })
     }
 
@@ -320,6 +375,7 @@ impl Router {
             forward_timeout_ms: None,
             batcher: Some(batcher),
             batch_max_wait_ms: Some(config.max_wait_ms),
+            test_cluster: None,
         })
     }
 
@@ -327,14 +383,31 @@ impl Router {
     /// - 原因: 需要 Router 绑定 RaftNode
     /// - 目的: 让写入路径走 RaftNode 封装
     pub fn new_with_raft(raft_node: RaftNode) -> Self {
+        let metrics = raft_node.raft.metrics().borrow().clone();
+        let is_leader = metrics.state == ServerState::Leader
+            && matches!(metrics.current_leader, Some(id) if id == raft_node.node_id());
         Self {
-            is_leader: true,
+            is_leader,
             state_machine: None,
             raft_node: Some(raft_node),
             leader_addr: None,
             forward_timeout_ms: None,
             batcher: None,
             batch_max_wait_ms: None,
+            test_cluster: None,
+        }
+    }
+
+    pub fn new_with_test_cluster(cluster: Arc<Mutex<TestCluster>>) -> Self {
+        Self {
+            is_leader: true,
+            state_machine: None,
+            raft_node: None,
+            leader_addr: None,
+            forward_timeout_ms: None,
+            batcher: None,
+            batch_max_wait_ms: None,
+            test_cluster: Some(cluster),
         }
     }
 
@@ -381,6 +454,7 @@ impl Router {
             // - 原因: 非 Leader 不使用批处理
             // - 目的: 避免无效配置
             batch_max_wait_ms: None,
+            test_cluster: None,
         }
     }
 
@@ -434,7 +508,7 @@ impl Router {
                     .await?;
                 Ok(value.parse::<u64>().unwrap_or(0))
             } else if let Some(raft_node) = &self.raft_node {
-                 // ### 修改记录 (2026-02-28)
+                // ### 修改记录 (2026-02-28)
                 // - 原因: RaftNode 场景也需要查询时间
                 // - 目的: 修复快照调度在 Raft 模式下的空指针异常
                 let value = raft_node
@@ -456,7 +530,7 @@ impl Router {
         if self.is_leader {
             let safe_path = snapshot_path.replace('\'', "''");
             let sql = format!("VACUUM INTO '{}'", safe_path);
-            
+
             if let Some(state_machine) = &self.state_machine {
                 let _ = state_machine.apply_write(sql).await?;
                 Ok(())
@@ -489,5 +563,47 @@ impl Router {
         } else {
             Ok(())
         }
+    }
+}
+
+// ### 修改记录 (2026-03-02)
+// - 原因: 需要复现测试环境 new_for_test 写入返回 0 的问题
+// - 目的: 以单元测试锁定批量写入的期望行为
+// - 目的: 为后续修复提供可验证的失败用例
+// - 备注: 该测试仅覆盖测试构造函数，不影响生产路径
+// - 备注: 通过最小 SQL 组合验证写入结果长度
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ### 修改记录 (2026-03-02)
+    // - 原因: 需要异步验证 write_batch 返回值
+    // - 目的: 证明 new_for_test(true) 必须具备可写状态机
+    // - 目的: 在修复前触发断言失败以满足 TDD 约束
+    // - 备注: SQL 组合包含 DDL + DML，确保 batch 返回长度可判断
+    // - 备注: 该测试仅验证行为，不依赖外部网络或 gRPC
+    #[tokio::test]
+    async fn new_for_test_leader_write_batch_returns_rows() -> Result<()> {
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 需要复现实例化路径
+        // - 目的: 覆盖 new_for_test(true) 的真实行为
+        let router = Router::new_for_test(true);
+
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 需要最小化写入场景
+        // - 目的: 组合 DDL 与 DML 形成可验证的 batch
+        // - 备注: CREATE TABLE IF NOT EXISTS 保证重复执行安全
+        let sqls = vec![
+            "CREATE TABLE IF NOT EXISTS t(id INTEGER)".to_string(),
+            "INSERT INTO t(id) VALUES (1)".to_string(),
+        ];
+
+        // ### 修改记录 (2026-03-02)
+        // - 原因: 需要验证批量写入返回值
+        // - 目的: 确保返回条数与提交 SQL 数量一致
+        let rows = router.write_batch(sqls).await?;
+        assert_eq!(rows, 2);
+
+        Ok(())
     }
 }
