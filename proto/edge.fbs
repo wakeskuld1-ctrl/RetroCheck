@@ -1,0 +1,88 @@
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要引入 FlatBuffers schema 以生成安全 API
+// - 目的: 统一 EdgeGateway 协议定义，替换手工解析
+// - 备注: 使用 flatc 生成 Rust 代码后由 edge_fbs 模块引入
+
+namespace edge;
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要定义上传记录的数据结构
+// - 目的: 让 UploadData 中的 records 可安全解析
+table DataRecord {
+  key: string;
+  value: [ubyte];
+  timestamp: ulong;
+}
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要表达心跳请求
+// - 目的: 支持 EdgeRequest::Heartbeat 解码
+table Heartbeat {
+  node_id: ulong;
+  timestamp: ulong;
+}
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要表达上传请求
+// - 目的: 支持 EdgeRequest::UploadData 解码
+table UploadData {
+  records: [DataRecord];
+}
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要表达认证请求
+// - 目的: 支持 AuthHello 的安全解析与验签
+table AuthHello {
+  device_id: ulong;
+  timestamp: ulong;
+  nonce: ulong;
+  mac: [ubyte];
+}
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要返回认证响应
+// - 目的: 支持 AuthAck 的安全解析
+table AuthAck {
+  session_id: ulong;
+  session_key: [ubyte];
+  ttl_ms: ulong;
+}
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要表达会话请求
+// - 目的: 支持 SessionRequest 的安全解析与验签
+table SessionRequest {
+  session_id: ulong;
+  timestamp_ms: ulong;
+  nonce: ulong;
+  mac: [ubyte];
+  payload: [ubyte];
+}
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要表达签名响应
+// - 目的: 支持 SignedResponse 的安全解析与验签
+table SignedResponse {
+  session_id: ulong;
+  timestamp_ms: ulong;
+  nonce: ulong;
+  mac: [ubyte];
+  payload: [ubyte];
+}
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要统一 EdgeRequest 的多态载荷
+// - 目的: 使用 union + table 组合表达请求类型
+union EdgeRequestPayload { Heartbeat, UploadData, AuthHello }
+
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要统一请求根类型
+// - 目的: 提供 EdgeRequest 的安全 root 解析入口
+table EdgeRequest {
+  // ### 修改记录 (2026-03-14)
+  // - 原因: union 字段会自动生成 req_type
+  // - 目的: 避免 flatc 报错重复字段
+  req: EdgeRequestPayload;
+}
+
+root_type EdgeRequest;

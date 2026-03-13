@@ -1,4 +1,8 @@
 pub mod edge_gateway;
+// ### 修改记录 (2026-03-14)
+// - 原因: 需要暴露 FlatBuffers 生成模块
+// - 目的: 让 edge_schema / edge_session_schema 复用安全解析
+pub mod edge_fbs;
 pub mod edge_schema;
 pub mod edge_session_schema;
 pub mod protocol;
