@@ -1,11 +1,12 @@
 use anyhow::Context;
-use flatbuffers::{FlatBufferBuilder, ForwardsUOffset, Table, WIPOffset};
+use flatbuffers::{FlatBufferBuilder, Table, WIPOffset};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::hub::edge_schema::{
-    EdgeRequest, decode_request, encode_request, verify_buffer_structure,
+    EdgeRequest, decode_request, encode_request,
 };
+use crate::hub::edge_fbs::edge as fbs;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -134,53 +135,41 @@ pub fn decode_auth_hello<F>(buf: &[u8], lookup_key: F) -> anyhow::Result<(Sessio
 where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
-    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid AuthHello: {}", e))?;
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 需要在解码前校验 AuthHello 的 FlatBuffers 结构
+    // - 目的: 避免非法 payload 触发 panic
+    let table = flatbuffers::root::<fbs::AuthHello>(buf)
+        .map_err(|e| anyhow::anyhow!("Invalid AuthHello: {e}"))?;
 
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
-        let device_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
-        let timestamp_ms = unsafe { table.get::<u64>(6, Some(0)).unwrap_or(0) };
-        let nonce = unsafe { table.get::<u64>(8, Some(0)).unwrap_or(0) };
-        let mac_vec = unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
-            .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
+    let device_id = table.device_id();
+    let timestamp_ms = table.timestamp();
+    let nonce = table.nonce();
+    let mac_vec = table
+        .mac()
+        .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
 
-        let secret = lookup_key(device_id).ok_or_else(|| anyhow::anyhow!("Unknown device"))?;
-        let signing = auth_hello_signing_input(device_id, timestamp_ms, nonce);
-        let expected = hmac_truncate_16(&secret, &signing)?;
-        let mac_bytes = mac_vec.bytes();
+    let secret = lookup_key(device_id).ok_or_else(|| anyhow::anyhow!("Unknown device"))?;
+    let signing = auth_hello_signing_input(device_id, timestamp_ms, nonce);
+    let expected = hmac_truncate_16(&secret, &signing)?;
+    let mac_bytes = mac_vec.bytes();
 
-        if mac_bytes.len() != expected.len() || mac_bytes != expected {
-            return Err(anyhow::anyhow!("AuthHello signature mismatch"));
-        }
-
-        let meta = SessionMeta {
-            device_id,
-            timestamp_ms,
-            nonce,
-            mac: expected,
-        };
-        let req = EdgeRequest::AuthHello {
-            device_id,
-            timestamp: timestamp_ms,
-            nonce,
-        };
-
-        Ok((meta, req))
-    }));
-
-    match parsed {
-        Ok(result) => result,
-        Err(payload) => {
-            let panic_msg = if let Some(msg) = payload.downcast_ref::<&str>() {
-                (*msg).to_string()
-            } else if let Some(msg) = payload.downcast_ref::<String>() {
-                msg.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            Err(anyhow::anyhow!("FlatBuffers decode panic: {panic_msg}"))
-        }
+    if mac_bytes.len() != expected.len() || mac_bytes != expected {
+        return Err(anyhow::anyhow!("AuthHello signature mismatch"));
     }
+
+    let meta = SessionMeta {
+        device_id,
+        timestamp_ms,
+        nonce,
+        mac: expected,
+    };
+    let req = EdgeRequest::AuthHello {
+        device_id,
+        timestamp: timestamp_ms,
+        nonce,
+    };
+
+    Ok((meta, req))
 }
 
 pub fn encode_auth_ack<'b>(
@@ -197,27 +186,23 @@ pub fn encode_auth_ack<'b>(
 }
 
 pub fn decode_auth_ack(buf: &[u8]) -> anyhow::Result<AuthAck> {
-    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid AuthAck: {}", e))?;
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 需要在解码前校验 AuthAck 的 FlatBuffers 结构
+    // - 目的: 避免非法 payload 触发 panic
+    let table = flatbuffers::root::<fbs::AuthAck>(buf)
+        .map_err(|e| anyhow::anyhow!("Invalid AuthAck: {e}"))?;
 
-    let parsed = std::panic::catch_unwind(|| {
-        let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
-        let session_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
-        let session_key_vec =
-            unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(6, None) }
-                .ok_or_else(|| anyhow::anyhow!("Missing session_key"))?;
-        let ttl_ms = unsafe { table.get::<u64>(8, Some(0)).unwrap_or(0) };
+    let session_id = table.session_id();
+    let session_key_vec = table
+        .session_key()
+        .ok_or_else(|| anyhow::anyhow!("Missing session_key"))?;
+    let ttl_ms = table.ttl_ms();
 
-        Ok(AuthAck {
-            session_id,
-            session_key: session_key_vec.bytes().to_vec(),
-            ttl_ms,
-        })
-    });
-
-    match parsed {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!("FlatBuffers decode panic")),
-    }
+    Ok(AuthAck {
+        session_id,
+        session_key: session_key_vec.bytes().to_vec(),
+        ttl_ms,
+    })
 }
 
 pub fn encode_session_request<'b>(
@@ -261,44 +246,39 @@ pub fn decode_session_request<F>(
 where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
-    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid SessionRequest: {}", e))?;
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 需要在解码前校验 SessionRequest 的 FlatBuffers 结构
+    // - 目的: 避免非法 payload 触发 panic
+    let table = flatbuffers::root::<fbs::SessionRequest>(buf)
+        .map_err(|e| anyhow::anyhow!("Invalid SessionRequest: {e}"))?;
 
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
-        let session_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
-        let timestamp_ms = unsafe { table.get::<u64>(6, Some(0)).unwrap_or(0) };
-        let nonce = unsafe { table.get::<u64>(8, Some(0)).unwrap_or(0) };
-        let mac_vec = unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
-            .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
-        let payload_vec =
-            unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(12, None) }
-                .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
+    let session_id = table.session_id();
+    let timestamp_ms = table.timestamp_ms();
+    let nonce = table.nonce();
+    let mac_vec = table.mac().ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
+    let payload_vec = table
+        .payload()
+        .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
 
-        let secret = lookup_key(session_id).ok_or_else(|| anyhow::anyhow!("Unknown session"))?;
-        let payload_bytes = payload_vec.bytes();
-        let signing = session_signing_input(session_id, timestamp_ms, nonce, payload_bytes);
-        let expected = hmac_truncate_16(&secret, &signing)?;
-        let mac_bytes = mac_vec.bytes();
+    let secret = lookup_key(session_id).ok_or_else(|| anyhow::anyhow!("Unknown session"))?;
+    let payload_bytes = payload_vec.bytes();
+    let signing = session_signing_input(session_id, timestamp_ms, nonce, payload_bytes);
+    let expected = hmac_truncate_16(&secret, &signing)?;
+    let mac_bytes = mac_vec.bytes();
 
-        if mac_bytes.len() != expected.len() || mac_bytes != expected {
-            return Err(anyhow::anyhow!("Session signature mismatch"));
-        }
-
-        let req = decode_request(payload_bytes)?;
-        let meta = SessionRequestMeta {
-            session_id,
-            timestamp_ms,
-            nonce,
-            mac: expected,
-        };
-
-        Ok((meta, req))
-    }));
-
-    match parsed {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!("FlatBuffers decode panic")),
+    if mac_bytes.len() != expected.len() || mac_bytes != expected {
+        return Err(anyhow::anyhow!("Session signature mismatch"));
     }
+
+    let req = decode_request(payload_bytes)?;
+    let meta = SessionRequestMeta {
+        session_id,
+        timestamp_ms,
+        nonce,
+        mac: expected,
+    };
+
+    Ok((meta, req))
 }
 
 pub fn encode_signed_response<'b>(
@@ -339,46 +319,41 @@ pub fn decode_signed_response<F>(
 where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
-    verify_buffer_structure(buf).map_err(|e| anyhow::anyhow!("Invalid SignedResponse: {}", e))?;
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 需要在解码前校验 SignedResponse 的 FlatBuffers 结构
+    // - 目的: 避免非法 payload 触发 panic
+    let table = flatbuffers::root::<fbs::SignedResponse>(buf)
+        .map_err(|e| anyhow::anyhow!("Invalid SignedResponse: {e}"))?;
 
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { flatbuffers::root_unchecked::<Table>(buf) };
-        let session_id = unsafe { table.get::<u64>(4, Some(0)).unwrap_or(0) };
-        let timestamp_ms = unsafe { table.get::<u64>(6, Some(0)).unwrap_or(0) };
-        let nonce = unsafe { table.get::<u64>(8, Some(0)).unwrap_or(0) };
-        let mac_vec = unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(10, None) }
-            .ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
-        let payload_vec =
-            unsafe { table.get::<ForwardsUOffset<flatbuffers::Vector<u8>>>(12, None) }
-                .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
+    let session_id = table.session_id();
+    let timestamp_ms = table.timestamp_ms();
+    let nonce = table.nonce();
+    let mac_vec = table.mac().ok_or_else(|| anyhow::anyhow!("Missing mac"))?;
+    let payload_vec = table
+        .payload()
+        .ok_or_else(|| anyhow::anyhow!("Missing payload"))?;
 
-        let secret = lookup_key(session_id).ok_or_else(|| anyhow::anyhow!("Unknown session"))?;
-        let payload_bytes = payload_vec.bytes();
-        let signing = signed_response_signing_input(
-            header_prefix,
-            session_id,
-            timestamp_ms,
-            nonce,
-            payload_bytes,
-        )?;
-        let expected = hmac_truncate_16(&secret, &signing)?;
-        let mac_bytes = mac_vec.bytes();
+    let secret = lookup_key(session_id).ok_or_else(|| anyhow::anyhow!("Unknown session"))?;
+    let payload_bytes = payload_vec.bytes();
+    let signing = signed_response_signing_input(
+        header_prefix,
+        session_id,
+        timestamp_ms,
+        nonce,
+        payload_bytes,
+    )?;
+    let expected = hmac_truncate_16(&secret, &signing)?;
+    let mac_bytes = mac_vec.bytes();
 
-        if mac_bytes.len() != expected.len() || mac_bytes != expected {
-            return Err(anyhow::anyhow!("SignedResponse signature mismatch"));
-        }
-
-        Ok(SignedResponse {
-            session_id,
-            timestamp_ms,
-            nonce,
-            payload: payload_bytes.to_vec(),
-            mac: expected,
-        })
-    }));
-
-    match parsed {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!("FlatBuffers decode panic")),
+    if mac_bytes.len() != expected.len() || mac_bytes != expected {
+        return Err(anyhow::anyhow!("SignedResponse signature mismatch"));
     }
+
+    Ok(SignedResponse {
+        session_id,
+        timestamp_ms,
+        nonce,
+        payload: payload_bytes.to_vec(),
+        mac: expected,
+    })
 }
