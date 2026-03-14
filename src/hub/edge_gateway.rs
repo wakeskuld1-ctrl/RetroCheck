@@ -698,6 +698,17 @@ impl NonceCache {
         let persistence = if let Some(path) = persist_path {
             let p = NoncePersistence::open(&path)?;
             items = p.load_all()?;
+            // ### 修改记录 (2026-03-14)
+            // - 原因: 持久化加载可能包含超出当前上限的旧 nonce
+            // - 目的: 按每组上限截断，避免首次加载就永久拒绝旧 nonce
+            for list in items.values_mut() {
+                // ### 修改记录 (2026-03-14)
+                // - 原因: 需要淘汰最早的 nonce
+                // - 目的: 保留最近的 limit 个值
+                while list.len() > limit {
+                    list.pop_front();
+                }
+            }
             Some(p)
         } else {
             None
