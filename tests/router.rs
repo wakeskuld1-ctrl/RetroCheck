@@ -26,6 +26,7 @@ use openraft::ServerState;
 // - 原因: 需要在测试中共享 Router
 // - 目的: 避免重复初始化并简化生命周期
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 // ### 修改记录 (2026-02-25)
 // - 原因: 需要临时 SQLite 文件
 // - 目的: 避免污染仓库目录
@@ -586,6 +587,81 @@ async fn router_forward_returns_execute_error_when_leader_sql_invalid() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("Leader execute failed"));
+}
+
+/// ### 修改记录 (2026-03-12)
+/// - 原因: 统一 SQL 路由错误码需要覆盖 follower 转发链路
+/// - 目的: 确认 leader 返回的 TARGET_METADATA_MISSING 能透传到 follower 调用方
+#[tokio::test]
+async fn router_forward_preserves_target_metadata_missing_for_edge_write() {
+    // ### 修改记录 (2026-03-12)
+    // - 原因: 需要真实 leader 执行校验逻辑
+    // - 目的: 复现 sys_edge_device 缺失导致的 TARGET_METADATA_MISSING
+    let temp_dir = TempDir::new().unwrap();
+    let leader_db = temp_dir.path().join("leader_meta_missing_forward.db");
+    let leader_router = Router::new_local_leader(leader_db.to_string_lossy().to_string()).unwrap();
+    let leader_addr = spawn_test_server(Arc::new(leader_router)).await;
+    let follower = Router::new_follower_with_leader_addr(leader_addr);
+    // ### 修改记录 (2026-03-12)
+    // - 原因: 固定值可能在预置元数据中存在导致测试误判
+    // - 目的: 用时间戳构造唯一 device_id，稳定命中 not found 分支
+    let missing_device_id = format!(
+        "dev-miss-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let err = follower
+        .write(
+            format!(
+                "CREATE TABLE IF NOT EXISTS t_target_miss(x INT) FOR EDGE(device_id={});",
+                missing_device_id
+            ),
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Leader execute failed"));
+    assert!(
+        msg.contains("TARGET_METADATA_MISSING"),
+        "expected TARGET_METADATA_MISSING in follower forwarded error, got {msg}"
+    );
+}
+
+/// ### 修改记录 (2026-03-12)
+/// - 原因: write_batch 在 follower 侧会逐条转发到 leader
+/// - 目的: 确认批量入口同样能保留 TARGET_METADATA_MISSING 错误码
+#[tokio::test]
+async fn router_forward_preserves_target_metadata_missing_for_edge_write_batch() {
+    let temp_dir = TempDir::new().unwrap();
+    let leader_db = temp_dir.path().join("leader_meta_missing_forward_batch.db");
+    let leader_router = Router::new_local_leader(leader_db.to_string_lossy().to_string()).unwrap();
+    let leader_addr = spawn_test_server(Arc::new(leader_router)).await;
+    let follower = Router::new_follower_with_leader_addr(leader_addr);
+    let missing_group_id = format!(
+        "group-miss-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let err = follower
+        .write_batch(vec![
+            "CREATE TABLE IF NOT EXISTS t_target_miss_batch(x INT)".to_string(),
+            format!(
+                "INSERT INTO t_target_miss_batch(x) VALUES (1) FOR EDGE(group_id={})",
+                missing_group_id
+            ),
+        ])
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Leader execute failed"));
+    assert!(
+        msg.contains("TARGET_METADATA_MISSING"),
+        "expected TARGET_METADATA_MISSING in follower forwarded batch error, got {msg}"
+    );
 }
 
 /// ### 修改记录 (2026-02-25)

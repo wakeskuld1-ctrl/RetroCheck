@@ -1,5 +1,5 @@
 use crate::pb::cluster_admin_server::ClusterAdmin;
-use crate::pb::{AddEdgeRequest, AddEdgeResponse, AddHubRequest, AddHubResponse, NodeCompatibility, RemoveHubRequest, RemoveHubResponse};
+use crate::pb::{AddHubRequest, AddHubResponse, NodeCompatibility, RemoveHubRequest, RemoveHubResponse};
 use crate::management::cluster_admin_domain::{
     AddHubError, CompatibilityChecker, StrictCompatibilityChecker, TopologyService,
     add_hub_error_response, default_compatibility as domain_default_compatibility,
@@ -32,6 +32,20 @@ pub struct ClusterAuditEvent {
     pub status: String,
     pub detail: String,
     pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddEdgeRequest {
+    pub edge_id: String,
+    pub group_id: Option<String>,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddEdgeResponse {
+    pub ready: bool,
+    pub reason_code: String,
+    pub suggested_action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,51 +337,33 @@ impl ClusterNodeManager {
             state.nodes.values().cloned().collect::<Vec<_>>()
         };
 
-        let mut hinted_leader: Option<u64> = None;
         for node in nodes {
             let metrics = node.raft.metrics().borrow().clone();
-            if metrics.state == ServerState::Leader {
+            if metrics.state == ServerState::Leader
+                && matches!(metrics.current_leader, Some(id) if id == node.node_id())
+            {
                 return Ok(Some(node.node_id()));
             }
-            if hinted_leader.is_none() {
-                hinted_leader = metrics.current_leader;
-            }
         }
-        Ok(hinted_leader)
+        Ok(None)
     }
 
     async fn ensure_leader_or_redirect(&self) -> Result<Option<String>> {
-        // ### ????
-        // - 2026-03-14: ??: ? leader ? wait_for_leader ?????
-        // - 2026-03-14: ??: ?? add_hub ?? NOT_LEADER + leader_hint
-        // - 2026-03-15: ??: ?? stash ???????
-        // - 2026-03-15: ??: ??????? cluster.redirect ??
-        let leader_id = self.current_leader_id().await?;
-        if let Some(leader_id) = leader_id {
-            if leader_id == self.local_node_id {
-                return Ok(None);
-            }
-            let leader_hint = self.resolve_leader_hint(leader_id).await;
-            // ### ???? (2026-03-15)
-            // - ??: ???????? leader_hint
-            // - ??: ???????????
-            self.append_audit_event(
-                "cluster.redirect",
-                "ok",
-                format!("leader_id={},leader_hint={}", leader_id, leader_hint),
-            )
-            .await;
-            return Ok(Some(leader_hint));
+        let leader_id = self.wait_for_leader().await?;
+        if leader_id == self.local_node_id {
+            return Ok(None);
         }
-
-        // ### ????
-        // - 2026-03-14: ??: ??????????????????
-        // - 2026-03-14: ??: ?? leader_node ???? hint
-        let fallback_id = self.leader_node.node_id();
-        Ok(Some(self.resolve_leader_hint(fallback_id).await))
+        let leader_hint = self.resolve_leader_hint(leader_id).await;
+        self.append_audit_event(
+            "cluster.redirect",
+            "ok",
+            format!("leader_id={},leader_hint={}", leader_id, leader_hint),
+        )
+        .await;
+        Ok(Some(leader_hint))
     }
 
-async fn precheck_add(
+    async fn precheck_add(
         &self,
         req: &AddHubRequest,
     ) -> std::result::Result<Option<AddHubResponse>, AddHubError> {
@@ -898,11 +894,11 @@ async fn precheck_add(
             }
         }
 
-        let maybe_group_id = if req.group_id.trim().is_empty() {
-            None
-        } else {
-            Some(req.group_id.trim().to_string())
-        };
+        let maybe_group_id = req
+            .group_id
+            .as_ref()
+            .map(|group_id| group_id.trim().to_string())
+            .filter(|group_id| !group_id.is_empty());
 
         if let Some(group_id) = maybe_group_id.clone() {
             match self.edge_metadata_provider.pull_group_metadata(&group_id).await {
@@ -1056,17 +1052,9 @@ impl ClusterAdmin for ClusterAdminService {
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(resp))
     }
-
-    async fn add_edge(
-        &self,
-        request: Request<AddEdgeRequest>,
-    ) -> Result<Response<AddEdgeResponse>, Status> {
-        let req = request.into_inner();
-        let resp = self.manager.add_edge(req).await;
-        Ok(Response::new(resp))
-    }
 }
 
 pub fn default_compatibility(app_semver: String) -> NodeCompatibility {
     domain_default_compatibility(app_semver)
 }
+// TEST APPEND

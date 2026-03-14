@@ -200,6 +200,26 @@ cargo run --bin client -- --master-addr http://127.0.0.1:50051 --slave-addrs htt
 - `--port <u16>`: gRPC port to bind.
 - `--db <path>`: SQLite database file path.
 - `--engine <name>`: Storage engine (default: `sqlite`).
+- `--addhub <host:port>`: one-command node add (Hub/Edge currently share AddHub flow).
+- `--removehub <host:port>`: one-command Hub removal (automatically runs `MARK_DRAINING -> COMMIT`).
+- `--removeedge <host:port>`: one-command Edge removal (automatically runs `MARK_DRAINING -> COMMIT`).
+- `--admin <url>`: ClusterAdmin endpoint (default: `http://127.0.0.1:50051`).
+- `--node-id <u64>`: explicit node ID override (recommended in production).
+
+### Hub / Edge Add & Remove Commands
+```bash
+# Add Hub (also used for Edge add in current CLI)
+cargo run --bin server -- --addhub 192.168.23.2:9060 --admin http://127.0.0.1:50051
+
+# Add Edge (same command path as Add Hub for now)
+cargo run --bin server -- --addhub 192.168.23.3:9060 --admin http://127.0.0.1:50051
+
+# Remove Hub
+cargo run --bin server -- --removehub 192.168.23.2:9060 --admin http://127.0.0.1:50051
+
+# Remove Edge
+cargo run --bin server -- --removeedge 192.168.23.3:9060 --admin http://127.0.0.1:50051
+```
 
 ### Client CLI
 - `--scenario <full|verify-only>`: Run full flow or verification only.

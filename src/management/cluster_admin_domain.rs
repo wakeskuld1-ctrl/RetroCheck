@@ -1,4 +1,4 @@
-use crate::pb::{AddHubRequest, AddHubResponse, NodeCompatibility};
+use crate::pb::{AddHubRequest, AddHubResponse, NodeCompatibility, RemoveHubResponse};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -88,6 +88,7 @@ pub trait CompatibilityChecker: Send + Sync {
 pub trait TopologyService: Send + Sync {
     fn upsert_grpc_addr(&self, node_id: u64, grpc_addr: String);
     fn get_grpc_addr(&self, node_id: u64) -> Option<String>;
+    fn remove_grpc_addr(&self, node_id: u64);
 }
 
 #[derive(Default)]
@@ -107,6 +108,12 @@ impl TopologyService for MemoryTopologyService {
             .read()
             .ok()
             .and_then(|addrs| addrs.get(&node_id).cloned())
+    }
+
+    fn remove_grpc_addr(&self, node_id: u64) {
+        if let Ok(mut addrs) = self.grpc_addrs.write() {
+            addrs.remove(&node_id);
+        }
     }
 }
 
@@ -147,6 +154,12 @@ impl TopologyService for SharedFileTopologyService {
 
     fn get_grpc_addr(&self, node_id: u64) -> Option<String> {
         self.read_registry().get(&node_id).cloned()
+    }
+
+    fn remove_grpc_addr(&self, node_id: u64) {
+        let mut registry = self.read_registry();
+        registry.remove(&node_id);
+        self.write_registry(&registry);
     }
 }
 
@@ -268,5 +281,30 @@ pub fn not_leader_response(leader_hint: String) -> AddHubResponse {
         leader_hint,
         reason_code: "NOT_LEADER".to_string(),
         suggested_action: "retry request to leader_hint endpoint".to_string(),
+    }
+}
+
+pub fn remove_hub_response(
+    membership_version: u64,
+    reason_code: impl Into<String>,
+    suggested_action: impl Into<String>,
+    status: impl Into<String>,
+) -> RemoveHubResponse {
+    RemoveHubResponse {
+        membership_version,
+        leader_hint: String::new(),
+        reason_code: reason_code.into(),
+        suggested_action: suggested_action.into(),
+        status: status.into(),
+    }
+}
+
+pub fn remove_hub_not_leader_response(leader_hint: String) -> RemoveHubResponse {
+    RemoveHubResponse {
+        membership_version: 0,
+        leader_hint,
+        reason_code: "NOT_LEADER".to_string(),
+        suggested_action: "retry request to leader_hint endpoint".to_string(),
+        status: String::new(),
     }
 }

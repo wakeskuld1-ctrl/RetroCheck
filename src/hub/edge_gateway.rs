@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
@@ -638,6 +638,99 @@ mod tests {
         sm.touch(sid, 50).expect("touch should succeed");
         let err = sm.get_by_id(sid, 101).unwrap_err();
         assert!(err.to_string().contains("expired"));
+    }
+
+    // ### ????
+    // - 2026-03-15: ??: DrainSignal ????????????
+    // - 2026-03-15: ??: ?? set_draining ?????????
+    #[tokio::test]
+    async fn edge_gateway_draining_flag_toggles() -> Result<()> {
+        // ### ???? (2026-03-15)
+        // - ??: ??????????????
+        // - ??: ??????????? IO
+        let router = Arc::new(Router::new_for_test(true));
+        router
+            .write("CREATE TABLE IF NOT EXISTS t(id INTEGER)".to_string())
+            .await?;
+        let order_rules_store = Arc::new(OrderRulesStore::new());
+        let gateway = EdgeGateway::new(
+            "127.0.0.1:0".to_string(),
+            router,
+            EdgeGatewayConfig {
+                session_ttl_ms: 5000,
+                nonce_cache_limit: 10,
+                nonce_persist_enabled: false,
+                nonce_persist_path: "".to_string(),
+                secret_key: "test_secret".to_string(),
+                max_connections: 10,
+                batch_max_size: 8,
+                batch_max_delay_ms: 5,
+                batch_max_queue_size: 8,
+                batch_wait_timeout_ms: 200,
+                ordering_stage_parallelism: 2,
+                ordering_queue_limit: 100,
+                batch_shards: 1,
+                pre_agg_enabled: false,
+                pre_agg_queue_size: 1024,
+                edge_client_retry_delay_ms: 100,
+                edge_client_retry_max_attempts: 3,
+                edge_client_retry_exponential_backoff: true,
+            },
+            order_rules_store,
+        )?;
+
+        gateway.set_draining(true);
+        assert!(gateway.draining.load(std::sync::atomic::Ordering::SeqCst));
+        gateway.set_draining(false);
+        assert!(!gateway.draining.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+
+    // ### ????
+    // - 2026-03-15: ??: DrainSignal ????????
+    // - 2026-03-15: ??: ?? inflight_requests ? guard ??
+    #[tokio::test]
+    async fn edge_gateway_inflight_guard_tracks_count() -> Result<()> {
+        // ### ???? (2026-03-15)
+        // - ??: ??????????????
+        // - ??: ?? guard ??????????
+        let router = Arc::new(Router::new_for_test(true));
+        router
+            .write("CREATE TABLE IF NOT EXISTS t(id INTEGER)".to_string())
+            .await?;
+        let order_rules_store = Arc::new(OrderRulesStore::new());
+        let gateway = EdgeGateway::new(
+            "127.0.0.1:0".to_string(),
+            router,
+            EdgeGatewayConfig {
+                session_ttl_ms: 5000,
+                nonce_cache_limit: 10,
+                nonce_persist_enabled: false,
+                nonce_persist_path: "".to_string(),
+                secret_key: "test_secret".to_string(),
+                max_connections: 10,
+                batch_max_size: 8,
+                batch_max_delay_ms: 5,
+                batch_max_queue_size: 8,
+                batch_wait_timeout_ms: 200,
+                ordering_stage_parallelism: 2,
+                ordering_queue_limit: 100,
+                batch_shards: 1,
+                pre_agg_enabled: false,
+                pre_agg_queue_size: 1024,
+                edge_client_retry_delay_ms: 100,
+                edge_client_retry_max_attempts: 3,
+                edge_client_retry_exponential_backoff: true,
+            },
+            order_rules_store,
+        )?;
+
+        assert_eq!(gateway.inflight_requests(), 0);
+        let guard = gateway.begin_inflight_guard();
+        assert_eq!(gateway.inflight_requests(), 1);
+        drop(guard);
+        assert_eq!(gateway.inflight_requests(), 0);
+        Ok(())
     }
 }
 
@@ -1751,6 +1844,14 @@ pub struct EdgeGateway {
     // - 目的: 统一使用 tokio::sync::Mutex
     blacklist: Arc<Mutex<Blacklist>>,
     concurrency_limit: Arc<Semaphore>,
+    // ### ????
+    // - 2026-03-15: ??: ????????????
+    // - 2026-03-15: ??: ? remove_hub ???????????
+    draining: Arc<AtomicBool>,
+    // ### ????
+    // - 2026-03-15: ??: ????????????
+    // - 2026-03-15: ??: ???????????
+    inflight_requests: Arc<AtomicU64>,
     // ### 修改记录 (2026-03-01)
     // - 原因: 需要在入口聚合写请求
     // - 目的: 避免每条请求直接打到 Raft
@@ -1779,6 +1880,32 @@ pub struct EdgeGateway {
     // - 原因: 需要运行期统计分段耗时
     // - 目的: 定位入口/批处理/回包瓶颈
     timing_stats: Arc<RequestTimingStats>,
+}
+
+// ### ????
+// - 2026-03-15: ??: ????????????????
+// - 2026-03-15: ??: ? RAII ?? inflight ??????
+struct InflightGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl InflightGuard {
+    // ### ????
+    // - 2026-03-15: ??: ?? guard ??????? +1
+    // - 2026-03-15: ??: ?? inflight ????????
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for InflightGuard {
+    // ### ????
+    // - 2026-03-15: ??: guard ?????????????
+    // - 2026-03-15: ??: ?? inflight ???????
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl EdgeGateway {
@@ -1868,6 +1995,14 @@ impl EdgeGateway {
             secret_key: config.secret_key.into_bytes(),
             blacklist: Arc::new(Mutex::new(blacklist)),
             concurrency_limit,
+            // ### ????
+            // - 2026-03-15: ??: ???????????
+            // - 2026-03-15: ??: ??? draining ??
+            draining: Arc::new(AtomicBool::new(false)),
+            // ### ????
+            // - 2026-03-15: ??: ?????????????
+            // - 2026-03-15: ??: ??? inflight ??
+            inflight_requests: Arc::new(AtomicU64::new(0)),
             batchers,
             pre_aggregator,
             order_rules_store,
@@ -1884,6 +2019,27 @@ impl EdgeGateway {
     // - 备注: 复用 shard_index_for_group 保持哈希一致
     pub fn shard_index_for_group(&self, group: &str) -> usize {
         shard_index_for_group(group, self.batchers.len())
+    }
+
+    // ### ????
+    // - 2026-03-15: ??: DrainSignal ?????????
+    // - 2026-03-15: ??: ? remove_hub ??????
+    pub fn set_draining(&self, reject_new: bool) {
+        self.draining.store(reject_new, Ordering::SeqCst);
+    }
+
+    // ### ????
+    // - 2026-03-15: ??: DrainSignal ??????????
+    // - 2026-03-15: ??: ????????
+    pub fn inflight_requests(&self) -> u64 {
+        self.inflight_requests.load(Ordering::SeqCst)
+    }
+
+    // ### ????
+    // - 2026-03-15: ??: ?????????????? inflight
+    // - 2026-03-15: ??: ?? guard ????????
+    fn begin_inflight_guard(&self) -> InflightGuard {
+        InflightGuard::new(self.inflight_requests.clone())
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -2043,6 +2199,13 @@ impl EdgeGateway {
         loop {
             let (socket, _) = listener.accept().await?;
 
+            // ### ????
+            // - 2026-03-15: ??: ???????????
+            // - 2026-03-15: ??: ?? inflight ????
+            if self.draining.load(Ordering::SeqCst) {
+                continue;
+            }
+
             // ### 修改记录 (2026-03-01)
             // - 原因: 需要限制并发连接数
             // - 目的: 防止资源耗尽 (DoS)
@@ -2052,9 +2215,25 @@ impl EdgeGateway {
             };
 
             let gateway = self.clone();
+            // ### ????
+            // - 2026-03-15: ??: ????????? inflight ??
+            // - 2026-03-15: ??: ????????????
+            let inflight_guard = gateway.begin_inflight_guard();
             tokio::spawn(async move {
-                // Drop permit when task finishes
+                // ### ????
+                // - 2026-03-15: ??: ???????????????
+                // - 2026-03-15: ??: ???? Semaphore ??
                 let _permit = permit;
+                // ### ????
+                // - 2026-03-15: ??: inflight ????????????
+                // - 2026-03-15: ??: guard drop ?????
+                let _inflight = inflight_guard;
+                // ### ????
+                // - 2026-03-15: ??: ?????????????
+                // - 2026-03-15: ??: ?? drain ????????
+                if gateway.draining.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Err(e) = gateway.handle_connection(socket).await {
                     eprintln!("Edge connection error: {:?}", e);
                 }

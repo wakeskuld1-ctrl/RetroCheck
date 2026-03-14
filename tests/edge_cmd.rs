@@ -645,7 +645,7 @@ fn ack_write_on_inactive_slot_is_readable_and_counts_unchanged() {
 /// - 原因: 需要评估清理对 ACK 的影响
 /// - 目的: 模拟仍需 ACK 的清理场景
 #[test]
-fn ack_is_cleared_after_cleanup_trigger_in_current_policy() {
+fn ack_remains_queryable_after_cleanup_trigger() {
     // ### 修改记录 (2026-02-28)
     // - 原因: 需要隔离目录
     // - 目的: 保证测试独立
@@ -696,11 +696,53 @@ fn ack_is_cleared_after_cleanup_trigger_in_current_policy() {
     // - 目的: 避免假阳性
     let stats = store.debug_stats().unwrap();
     assert!(stats.last_cleanup_ms > 0);
-    // ### 修改记录 (2026-02-28)
-    // - 原因: 需要读取 ACK
-    // - 目的: 评估当前清理策略影响
+    // ### 修改记录 (2026-03-09)
+    // - 原因: Phase 2 要求恢复后可查询回执
+    // - 目的: 锁定清理后 ACK 仍可读语义
     let ack = store.get_cmd_ack(&cmd_key).unwrap();
-    assert!(ack.is_none());
+    assert_eq!(
+        ack,
+        Some(AckRecord {
+            status: AckStatus::Executed,
+            exec_seq: 99,
+        })
+    );
+}
+
+/// ### 修改记录 (2026-03-09)
+/// - 原因: Phase 1 需要先锁定“恢复后可查询”能力缺口
+/// - 目的: 明确清理后 ACK 仍应可查询，避免恢复窗口丢失确认结果
+#[test]
+fn ack_should_remain_queryable_after_cleanup_trigger() {
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("edge_config.json");
+    write_edge_config(&config_path, 0.5);
+    let store = EdgeStore::open_with_config_file(dir.path(), &config_path).unwrap();
+    for seq in 0..10 {
+        store.put_log(80, seq, b"a".to_vec()).unwrap();
+    }
+    let cmd_key = store.cmd_key(80, 99);
+    store
+        .put_cmd_ack(
+            &cmd_key,
+            AckRecord {
+                status: AckStatus::Executed,
+                exec_seq: 99,
+            },
+        )
+        .unwrap();
+    store.set_active_slot(1).unwrap();
+    for seq in 0..6 {
+        store.put_log(81, seq, b"b".to_vec()).unwrap();
+    }
+    let ack = store.get_cmd_ack(&cmd_key).unwrap();
+    assert_eq!(
+        ack,
+        Some(AckRecord {
+            status: AckStatus::Executed,
+            exec_seq: 99,
+        })
+    );
 }
 
 /// ### 修改记录 (2026-02-28)

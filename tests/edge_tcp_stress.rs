@@ -103,6 +103,86 @@ async fn retry_runner_should_fail_after_shared_attempt_limit_exhausted() {
     assert_eq!(attempts, 2);
 }
 
+// ### 修改记录 (2026-03-09)
+// - 原因: Phase 1 需要先锁定“错误语义边界”缺口
+// - 目的: 明确不可重试错误不应继续重试，避免在 failover 窗口放大无效请求
+#[tokio::test]
+async fn retry_runner_should_stop_immediately_on_non_retryable_error() {
+    let retry_config = EdgeClientRetryConfig {
+        retry_delay_ms: 0,
+        retry_max_attempts: 3,
+        retry_exponential_backoff: false,
+    };
+    let mut attempts = 0u32;
+    let result = run_with_retry(retry_config, |_retry_index| {
+        attempts = attempts.saturating_add(1);
+        async move { Err(anyhow!("NON_RETRYABLE:invalid_payload")) as Result<u64> }
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(attempts, 1);
+}
+
+// ### 修改记录 (2026-03-09)
+// - 原因: Phase 3 需要统一“带上下文重试执行器”的不可重试错误边界
+// - 目的: 防止 send/recv 场景在不可恢复错误下继续重试放大故障
+#[tokio::test]
+async fn retry_runner_with_ctx_should_stop_immediately_on_non_retryable_error() {
+    let retry_config = EdgeClientRetryConfig {
+        retry_delay_ms: 0,
+        retry_max_attempts: 3,
+        retry_exponential_backoff: false,
+    };
+    let mut attempts = 0u32;
+    let mut ctx = 0u64;
+    let result = run_with_retry_with_ctx(retry_config, &mut ctx, |_retry_index, _ctx| {
+        attempts = attempts.saturating_add(1);
+        Box::pin(async move { Err(anyhow!("NON_RETRYABLE:invalid_session")) as Result<u64> })
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(attempts, 1);
+}
+
+// ### 修改记录 (2026-03-09)
+// - 原因: Phase 3 需要收敛错误语义大小写边界
+// - 目的: 避免上游前缀大小写差异导致误重试
+#[tokio::test]
+async fn retry_runner_should_stop_on_non_retryable_error_case_insensitive() {
+    let retry_config = EdgeClientRetryConfig {
+        retry_delay_ms: 0,
+        retry_max_attempts: 3,
+        retry_exponential_backoff: false,
+    };
+    let mut attempts = 0u32;
+    let result = run_with_retry(retry_config, |_retry_index| {
+        attempts = attempts.saturating_add(1);
+        async move { Err(anyhow!("non_retryable:schema_mismatch")) as Result<u64> }
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(attempts, 1);
+}
+
+// ### 修改记录 (2026-03-09)
+// - 原因: Phase 3 需要显式固化三层错误语义
+// - 目的: 防止后续改动把“切主后重试”与一般重试混淆
+#[test]
+fn retry_error_semantics_should_split_three_categories() {
+    assert_eq!(
+        classify_retry_error(&anyhow!("NON_RETRYABLE:invalid_payload")),
+        RetryErrorSemantics::NonRetryable
+    );
+    assert_eq!(
+        classify_retry_error(&anyhow!("RETRY_WITH_LEADER_SWITCH:not_leader")),
+        RetryErrorSemantics::RetryAfterLeaderSwitch
+    );
+    assert_eq!(
+        classify_retry_error(&anyhow!("transient_timeout")),
+        RetryErrorSemantics::Retryable
+    );
+}
+
 // ### 修改记录 (2026-03-05)
 // - 原因: 随机批量上传路径曾把业务失败判定放在重试闭包外，导致业务失败不触发重试
 // - 目的: 锁定“业务失败也要进入统一重试”的行为，防止 failover 窗口内请求直接丢失
@@ -392,6 +472,30 @@ impl EdgeClientRetryConfig {
     }
 }
 
+// ### 修改记录 (2026-03-09)
+// - 原因: Phase 3 需要把重试错误语义统一为三层
+// - 目的: 保证重试器对可重试/不可重试/切主后重试判定一致
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryErrorSemantics {
+    Retryable,
+    NonRetryable,
+    RetryAfterLeaderSwitch,
+}
+
+// ### 修改记录 (2026-03-09)
+// - 原因: 需要对上游错误文案做统一归类
+// - 目的: 避免不同入口使用各自字符串判断造成语义漂移
+fn classify_retry_error(error: &anyhow::Error) -> RetryErrorSemantics {
+    let message = error.to_string().to_ascii_uppercase();
+    if message.contains("NON_RETRYABLE:") {
+        return RetryErrorSemantics::NonRetryable;
+    }
+    if message.contains("RETRY_WITH_LEADER_SWITCH:") || message.contains("NOT_LEADER") {
+        return RetryErrorSemantics::RetryAfterLeaderSwitch;
+    }
+    RetryErrorSemantics::Retryable
+}
+
 // ### 修改记录 (2026-03-04)
 // - 原因: 需要把重试次数统一抽象到单一执行器
 // - 目的: 确保端到端各阶段共享同一套重试参数
@@ -406,6 +510,13 @@ where
         match op(retry_index).await {
             Ok(value) => return Ok(value),
             Err(error) => {
+                // ### 修改记录 (2026-03-09)
+                // - 原因: 不可重试错误继续重试会放大失败窗口
+                // - 目的: 命中不可重试错误时立即短路返回
+                match classify_retry_error(&error) {
+                    RetryErrorSemantics::NonRetryable => return Err(error),
+                    RetryErrorSemantics::RetryAfterLeaderSwitch | RetryErrorSemantics::Retryable => {}
+                }
                 last_error = error;
                 if retry_index + 1 < attempts {
                     tokio::time::sleep(retry_config.delay_for_retry(retry_index)).await;
@@ -433,6 +544,13 @@ where
         match op(retry_index, ctx).await {
             Ok(value) => return Ok(value),
             Err(error) => {
+                // ### 修改记录 (2026-03-09)
+                // - 原因: 带上下文重试执行器也需要同一错误边界
+                // - 目的: send/recv 阶段命中不可重试错误时立即返回
+                match classify_retry_error(&error) {
+                    RetryErrorSemantics::NonRetryable => return Err(error),
+                    RetryErrorSemantics::RetryAfterLeaderSwitch | RetryErrorSemantics::Retryable => {}
+                }
                 last_error = error;
                 if retry_index + 1 < attempts {
                     tokio::time::sleep(retry_config.delay_for_retry(retry_index)).await;

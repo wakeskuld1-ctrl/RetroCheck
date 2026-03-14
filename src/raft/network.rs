@@ -68,6 +68,11 @@ impl RaftRouter {
         targets.insert(node_id, target);
     }
 
+    pub fn unregister(&self, node_id: NodeId) -> bool {
+        let mut targets = lock_or_recover(&self.targets);
+        targets.remove(&node_id).is_some()
+    }
+
     pub async fn send_append_entries(
         &self,
         target: NodeId,

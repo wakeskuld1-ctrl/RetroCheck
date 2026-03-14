@@ -402,8 +402,18 @@ impl EdgeStore {
         // - 目的: 避免迭代中删除
         let mut keys = Vec::new();
         let slot_prefix = Self::slot_prefix_for(slot);
+        // ### 修改记录 (2026-03-09)
+        // - 原因: 需要在清理旧槽位时保留 ACK 元信息
+        // - 目的: 故障恢复窗口内仍可查询执行回执
+        let ack_prefix = self.prefixed_namespace(slot, ACK_PREFIX);
         for item in self.db.scan_prefix(slot_prefix) {
             let (key, _value) = item?;
+            // ### 修改记录 (2026-03-09)
+            // - 原因: ACK 需要跨槽位清理保留
+            // - 目的: 避免清理后查询回执丢失
+            if key.as_ref().starts_with(ack_prefix.as_slice()) {
+                continue;
+            }
             keys.push(key.to_vec());
         }
         // ### 修改记录 (2026-02-26)

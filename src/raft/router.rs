@@ -14,6 +14,252 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use uuid::Uuid;
+
+// ### 修改记录 (2026-03-10)
+// - 原因: 统一 SQL 语法新增了标准错误码
+// - 目的: 在 SQL 路由解析层稳定返回可断言的错误编码
+const ROUTE_INVALID: &str = "ROUTE_INVALID";
+// ### 修改记录 (2026-03-10)
+// - 原因: 统一 SQL 规范要求键列不能是 eventual
+// - 目的: 在路由入口前置拦截非法一致性声明
+const COLUMN_CONSISTENCY_INVALID: &str = "COLUMN_CONSISTENCY_INVALID";
+// ### 修改记录 (2026-03-10)
+// - 原因: 方案A需要补齐目标存在性错误码
+// - 目的: 路由目标不存在时返回稳定可断言的标准错误
+const TARGET_NOT_FOUND: &str = "TARGET_NOT_FOUND";
+const TARGET_METADATA_MISSING: &str = "TARGET_METADATA_MISSING";
+
+#[derive(Debug, Clone)]
+enum RouteTarget {
+    Hub,
+    EdgeDevice(String),
+    EdgeGroup(String),
+    EdgeAll,
+}
+
+struct ParsedRouteSql {
+    body_sql: String,
+    target: RouteTarget,
+}
+
+enum RouteTargetLookup {
+    Exists,
+    NotFound,
+    MetadataMissing,
+}
+
+fn code_error(code: &str, message: &str) -> anyhow::Error {
+    anyhow!("{code}: {message}")
+}
+
+fn parse_route_sql(raw_sql: &str) -> Result<ParsedRouteSql> {
+    let trimmed = raw_sql.trim();
+    if trimmed.is_empty() {
+        return Err(code_error(ROUTE_INVALID, "SQL is empty"));
+    }
+
+    let without_semicolon = trimmed.trim_end_matches(';').trim_end();
+    let upper = without_semicolon.to_ascii_uppercase();
+
+    if upper.ends_with("FOR HUB") {
+        let route_pos = upper
+            .rfind("FOR HUB")
+            .ok_or_else(|| code_error(ROUTE_INVALID, "invalid FOR HUB clause"))?;
+        let body = without_semicolon[..route_pos].trim_end();
+        if body.is_empty() {
+            return Err(code_error(ROUTE_INVALID, "missing SQL body before FOR HUB"));
+        }
+        return Ok(ParsedRouteSql {
+            body_sql: body.to_string(),
+            target: RouteTarget::Hub,
+        });
+    }
+
+    if upper.ends_with(')') && let Some(route_pos) = upper.rfind("FOR EDGE(") {
+        let suffix_start = route_pos + "FOR EDGE(".len();
+        if suffix_start >= without_semicolon.len() {
+            return Err(code_error(ROUTE_INVALID, "missing EDGE route parameters"));
+        }
+        let body = without_semicolon[..route_pos].trim_end();
+        if body.is_empty() {
+            return Err(code_error(
+                ROUTE_INVALID,
+                "missing SQL body before FOR EDGE",
+            ));
+        }
+        let params = &without_semicolon[suffix_start..without_semicolon.len() - 1];
+        let mut parts = params.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(code_error(
+                ROUTE_INVALID,
+                "EDGE route parameter must be key=value",
+            ));
+        }
+        let target = if key.eq_ignore_ascii_case("device_id") {
+            if value.eq_ignore_ascii_case("all") {
+                RouteTarget::EdgeAll
+            } else {
+                RouteTarget::EdgeDevice(value.to_string())
+            }
+        } else if key.eq_ignore_ascii_case("group_id") {
+            RouteTarget::EdgeGroup(value.to_string())
+        } else {
+            return Err(code_error(
+                ROUTE_INVALID,
+                "EDGE route only supports device_id/group_id",
+            ));
+        };
+        return Ok(ParsedRouteSql {
+            body_sql: body.to_string(),
+            target,
+        });
+    }
+
+    Ok(ParsedRouteSql {
+        body_sql: without_semicolon.to_string(),
+        target: RouteTarget::Hub,
+    })
+}
+
+// ### 修改记录 (2026-03-10)
+// - 原因: 统一 SQL 语法只扩展 FOR 尾部路由，不改 SQL 主体
+// - 目的: 通过首关键字快速判定 DDL，降低运行期开销
+fn first_keyword(sql: &str) -> String {
+    sql.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
+// ### 修改记录 (2026-03-10)
+// - 原因: 键列一致性只在 DDL 场景校验
+// - 目的: 将 DDL 与 DML 约束路径解耦，便于后续扩展
+fn is_ddl(sql: &str) -> bool {
+    matches!(first_keyword(sql).as_str(), "CREATE" | "ALTER" | "DROP")
+}
+
+// ### 修改记录 (2026-03-10)
+// - 原因: CREATE TABLE 列定义里可能包含函数括号
+// - 目的: 只按顶层逗号拆分列定义，避免误切分
+fn split_top_level_by_comma(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                out.push(input[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(input[start..].trim());
+    out
+}
+
+// ### 修改记录 (2026-03-10)
+// - 原因: 规范要求主键/唯一键列不能声明 eventual
+// - 目的: 在 SQL 进入状态机前做快速一致性拦截
+fn validate_create_table_key_consistency(sql: &str) -> Result<()> {
+    let upper = sql.to_ascii_uppercase();
+    if !upper.starts_with("CREATE TABLE") {
+        return Ok(());
+    }
+    if !upper.contains("CONSISTENCY:EVENTUAL") {
+        return Ok(());
+    }
+    let start = sql
+        .find('(')
+        .ok_or_else(|| code_error(ROUTE_INVALID, "CREATE TABLE missing '('"))?;
+    let end = sql
+        .rfind(')')
+        .ok_or_else(|| code_error(ROUTE_INVALID, "CREATE TABLE missing ')'"))?;
+    if end <= start {
+        return Err(code_error(ROUTE_INVALID, "CREATE TABLE column list is invalid"));
+    }
+    let columns = &sql[start + 1..end];
+    let defs = split_top_level_by_comma(columns);
+    for def in defs {
+        let def_upper = def.to_ascii_uppercase();
+        if def_upper.contains("CONSISTENCY:EVENTUAL")
+            && (def_upper.contains("PRIMARY KEY") || def_upper.contains("UNIQUE"))
+        {
+            return Err(code_error(
+                COLUMN_CONSISTENCY_INVALID,
+                "key column cannot declare eventual consistency",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ### 修改记录 (2026-03-10)
+// - 原因: ALTER TABLE ADD COLUMN 也可能携带一致性注释
+// - 目的: 保持 DDL 路径对键列一致性约束一致
+fn validate_alter_add_column_key_consistency(sql: &str) -> Result<()> {
+    let upper = sql.to_ascii_uppercase();
+    if !upper.starts_with("ALTER TABLE") || !upper.contains("ADD COLUMN") {
+        return Ok(());
+    }
+    if upper.contains("CONSISTENCY:EVENTUAL")
+        && (upper.contains("PRIMARY KEY") || upper.contains("UNIQUE"))
+    {
+        return Err(code_error(
+            COLUMN_CONSISTENCY_INVALID,
+            "key column cannot declare eventual consistency",
+        ));
+    }
+    Ok(())
+}
+
+// ### 修改记录 (2026-03-10)
+// - 原因: 系统表 sys_column_consistency 是一致性元数据事实源
+// - 目的: 防止将 is_key_column=1 的元数据写成 eventual
+fn validate_sys_column_consistency_dml(sql: &str) -> Result<()> {
+    let upper = sql.to_ascii_uppercase();
+    if !upper.contains("SYS_COLUMN_CONSISTENCY") {
+        return Ok(());
+    }
+    if upper.contains("EVENTUAL") && upper.contains("IS_KEY_COLUMN") && upper.contains("1") {
+        return Err(code_error(
+            COLUMN_CONSISTENCY_INVALID,
+            "sys_column_consistency key column must stay strong",
+        ));
+    }
+    Ok(())
+}
+
+// ### 修改记录 (2026-03-10)
+// - 原因: 需要在单一入口同时处理路由尾缀与一致性约束
+// - 目的: 返回可直接执行的标准 SQL 主体，避免 SQLite 语法报错
+fn normalize_sql_for_write(raw_sql: &str) -> Result<String> {
+    let parsed = parse_route_sql(raw_sql)?;
+    match &parsed.target {
+        RouteTarget::Hub | RouteTarget::EdgeAll => {}
+        RouteTarget::EdgeDevice(device_id) => {
+            if device_id.is_empty() {
+                return Err(code_error(ROUTE_INVALID, "device_id cannot be empty"));
+            }
+        }
+        RouteTarget::EdgeGroup(group_id) => {
+            if group_id.is_empty() {
+                return Err(code_error(ROUTE_INVALID, "group_id cannot be empty"));
+            }
+        }
+    }
+    if is_ddl(&parsed.body_sql) {
+        validate_create_table_key_consistency(&parsed.body_sql)?;
+        validate_alter_add_column_key_consistency(&parsed.body_sql)?;
+    }
+    validate_sys_column_consistency_dml(&parsed.body_sql)?;
+    Ok(parsed.body_sql)
+}
 
 #[derive(Clone)]
 pub struct BatchConfig {
@@ -172,6 +418,99 @@ pub struct Router {
 }
 
 impl Router {
+    // ### 修改记录 (2026-03-10)
+    // - 原因: 路由目标校验需要构造安全 SQL 字面量
+    // - 目的: 防止 device_id/group_id 包含单引号时破坏查询语句
+    fn escape_sql_literal(raw: &str) -> String {
+        raw.replace('\'', "''")
+    }
+
+    // ### 修改记录 (2026-03-10)
+    // - 原因: 方案A要求在写入前校验路由目标是否存在
+    // - 目的: 抽象统一查询入口，便于 state_machine/raft_node 复用
+    async fn query_route_target_exists(&self, sql: String) -> Result<RouteTargetLookup> {
+        if let Some(state_machine) = &self.state_machine {
+            match state_machine.query_scalar(sql.clone()).await {
+                Ok(value) => {
+                    return if value.trim() == "1" {
+                        Ok(RouteTargetLookup::Exists)
+                    } else {
+                        Ok(RouteTargetLookup::NotFound)
+                    };
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.to_ascii_lowercase().contains("no such table") {
+                        return Ok(RouteTargetLookup::MetadataMissing);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(raft_node) = &self.raft_node {
+            match raft_node.query_scalar(sql).await {
+                Ok(value) => {
+                    return if value.trim() == "1" {
+                        Ok(RouteTargetLookup::Exists)
+                    } else {
+                        Ok(RouteTargetLookup::NotFound)
+                    };
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.to_ascii_lowercase().contains("no such table") {
+                        return Ok(RouteTargetLookup::MetadataMissing);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(RouteTargetLookup::Exists)
+    }
+
+    // ### 修改记录 (2026-03-10)
+    // - 原因: 统一 SQL 规范要求边缘路由目标可校验
+    // - 目的: 在执行前拦截不存在的 group/device，返回 TARGET_NOT_FOUND
+    async fn validate_route_target_exists(&self, target: &RouteTarget) -> Result<()> {
+        match target {
+            RouteTarget::Hub | RouteTarget::EdgeAll => Ok(()),
+            RouteTarget::EdgeDevice(device_id) => {
+                let exists_sql = format!(
+                    "SELECT EXISTS(SELECT 1 FROM sys_edge_device WHERE device_id='{}')",
+                    Self::escape_sql_literal(device_id)
+                );
+                match self.query_route_target_exists(exists_sql).await? {
+                    RouteTargetLookup::Exists => Ok(()),
+                    RouteTargetLookup::NotFound => Err(code_error(
+                        TARGET_NOT_FOUND,
+                        "edge target device_id not found in sys_edge_device",
+                    )),
+                    RouteTargetLookup::MetadataMissing => Err(code_error(
+                        TARGET_METADATA_MISSING,
+                        "sys_edge_device metadata table is missing",
+                    )),
+                }
+            }
+            RouteTarget::EdgeGroup(group_id) => {
+                let exists_sql = format!(
+                    "SELECT EXISTS(SELECT 1 FROM sys_edge_group WHERE group_id='{}')",
+                    Self::escape_sql_literal(group_id)
+                );
+                match self.query_route_target_exists(exists_sql).await? {
+                    RouteTargetLookup::Exists => Ok(()),
+                    RouteTargetLookup::NotFound => Err(code_error(
+                        TARGET_NOT_FOUND,
+                        "edge target group_id not found in sys_edge_group",
+                    )),
+                    RouteTargetLookup::MetadataMissing => Err(code_error(
+                        TARGET_METADATA_MISSING,
+                        "sys_edge_group metadata table is missing",
+                    )),
+                }
+            }
+        }
+    }
+
     fn is_raft_leader(&self) -> bool {
         if let Some(raft_node) = &self.raft_node {
             let metrics_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -217,7 +556,10 @@ impl Router {
                 .unwrap_or_default()
                 .as_nanos();
             let mut path = std::env::temp_dir();
-            path.push(format!("check_program_test_{}.db", suffix));
+            // ### 修改记录 (2026-03-10)
+            // - 原因: 并发测试中纳秒时间戳可能重复导致 SQLite 文件冲突
+            // - 目的: 追加 UUID 彻底消除测试库路径碰撞
+            path.push(format!("check_program_test_{}_{}.db", suffix, Uuid::new_v4()));
             let path_str = path.to_string_lossy().to_string();
             // ### 修改记录 (2026-03-03)
             // - 原因: 需要确保测试立刻失败而非静默返回 0
@@ -251,25 +593,29 @@ impl Router {
     /// - 原因: 非 Leader 需要转发到 Leader
     /// - 目的: 统一由 Router 承担转发职责
     pub async fn write(&self, sql: String) -> Result<usize> {
+        // ### 修改记录 (2026-03-12)
+        // - 原因: follower 预归一化会丢失 FOR EDGE 路由尾缀，导致 leader 无法做目标校验
+        // - 目的: 非 Leader 场景转发原始 SQL，确保错误码由 leader 侧统一产出与透传
+        if !self.is_raft_leader() {
+            return self.forward_write_to_leader(sql).await;
+        }
+        let parsed_route = parse_route_sql(&sql)?;
+        self.validate_route_target_exists(&parsed_route.target).await?;
+        let normalized_sql = normalize_sql_for_write(&sql)?;
         if let Some(cluster) = &self.test_cluster {
             let guard = cluster.lock().await;
-            guard.write(sql).await?;
+            guard.write(normalized_sql).await?;
             return Ok(1);
         }
-        let is_leader = self.is_raft_leader();
-        if is_leader {
-            if let Some(batcher) = &self.batcher {
-                let wait_ms = self.batch_max_wait_ms.unwrap_or(0);
-                batcher.enqueue(sql, wait_ms).await
-            } else if let Some(raft_node) = &self.raft_node {
-                raft_node.apply_sql(sql).await
-            } else if let Some(state_machine) = &self.state_machine {
-                state_machine.apply_write(sql).await
-            } else {
-                Ok(0)
-            }
+        if let Some(batcher) = &self.batcher {
+            let wait_ms = self.batch_max_wait_ms.unwrap_or(0);
+            batcher.enqueue(normalized_sql, wait_ms).await
+        } else if let Some(raft_node) = &self.raft_node {
+            raft_node.apply_sql(normalized_sql).await
+        } else if let Some(state_machine) = &self.state_machine {
+            state_machine.apply_write(normalized_sql).await
         } else {
-            self.forward_write_to_leader(sql).await
+            Ok(0)
         }
     }
 
@@ -280,27 +626,34 @@ impl Router {
         if sqls.is_empty() {
             return Ok(0);
         }
-        if let Some(cluster) = &self.test_cluster {
-            let guard = cluster.lock().await;
-            return guard.write_batch(sqls).await;
-        }
-
-        let is_leader = self.is_raft_leader();
-        if is_leader {
-            if let Some(raft_node) = &self.raft_node {
-                raft_node.apply_sql_batch(sqls).await
-            } else if let Some(state_machine) = &self.state_machine {
-                let results = state_machine.apply_batch(sqls).await?;
-                Ok(results.len())
-            } else {
-                Ok(0)
-            }
-        } else {
+        // ### 修改记录 (2026-03-12)
+        // - 原因: follower 批量路径此前转发的是归一化 SQL，leader 无法识别路由上下文
+        // - 目的: 非 Leader 批量写入直接转发原始 SQL，保持与单条写入一致的错误语义
+        if !self.is_raft_leader() {
             let mut total_rows = 0usize;
             for sql in sqls {
                 total_rows = total_rows.saturating_add(self.forward_write_to_leader(sql).await?);
             }
-            Ok(total_rows)
+            return Ok(total_rows);
+        }
+        let mut normalized_sqls = Vec::with_capacity(sqls.len());
+        for sql in sqls {
+            let parsed_route = parse_route_sql(&sql)?;
+            self.validate_route_target_exists(&parsed_route.target).await?;
+            normalized_sqls.push(normalize_sql_for_write(&sql)?);
+        }
+        if let Some(cluster) = &self.test_cluster {
+            let guard = cluster.lock().await;
+            return guard.write_batch(normalized_sqls).await;
+        }
+
+        if let Some(raft_node) = &self.raft_node {
+            raft_node.apply_sql_batch(normalized_sqls).await
+        } else if let Some(state_machine) = &self.state_machine {
+            let results = state_machine.apply_batch(normalized_sqls).await?;
+            Ok(results.len())
+        } else {
+            Ok(0)
         }
     }
 
@@ -605,5 +958,302 @@ mod tests {
         assert_eq!(rows, 2);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_accepts_for_hub_suffix() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 统一 SQL 规范要求 FOR HUB 由路由层识别而非 SQLite
+        // - 目的: 锁定尾缀剥离后 SQL 仍可执行
+        let router = Router::new_for_test(true);
+        let res = router
+            .write("CREATE TABLE IF NOT EXISTS hub_only(id INTEGER) FOR HUB;".to_string())
+            .await;
+        assert!(res.is_ok(), "expected FOR HUB to be accepted, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn write_rejects_invalid_edge_route_clause() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 规范要求 FOR EDGE 仅允许 device_id/group_id 参数
+        // - 目的: 锁定 ROUTE_INVALID 错误码行为
+        let router = Router::new_for_test(true);
+        let err = router
+            .write("INSERT INTO t(id) VALUES (1) FOR EDGE(foo=1);".to_string())
+            .await
+            .expect_err("invalid route clause should fail");
+        assert!(
+            err.to_string().contains("ROUTE_INVALID"),
+            "expected ROUTE_INVALID, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_eventual_consistency_on_key_column() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 键列一致性必须强一致
+        // - 目的: 锁定 COLUMN_CONSISTENCY_INVALID 错误码
+        let router = Router::new_for_test(true);
+        let err = router
+            .write(
+                "CREATE TABLE telemetry_k(id TEXT PRIMARY KEY /* consistency:eventual */, temp REAL) FOR HUB;"
+                    .to_string(),
+            )
+            .await
+            .expect_err("key column eventual should fail");
+        assert!(
+            err.to_string().contains("COLUMN_CONSISTENCY_INVALID"),
+            "expected COLUMN_CONSISTENCY_INVALID, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_allows_eventual_consistency_on_non_key_column() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 规范允许非键列声明 eventual
+        // - 目的: 避免误伤合法 SQL
+        let router = Router::new_for_test(true);
+        let res = router
+            .write(
+                "CREATE TABLE telemetry_ok(id TEXT PRIMARY KEY, temp REAL /* consistency:eventual */) FOR HUB;"
+                    .to_string(),
+            )
+            .await;
+        assert!(res.is_ok(), "non-key eventual should be allowed, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn write_batch_rejects_invalid_route_clause() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 批量写入也必须逐条经过统一路由校验
+        // - 目的: 防止非法路由 SQL 混入批次
+        let router = Router::new_for_test(true);
+        let err = router
+            .write_batch(vec![
+                "CREATE TABLE IF NOT EXISTS batch_t(id INTEGER) FOR HUB;".to_string(),
+                "INSERT INTO batch_t(id) VALUES (1) FOR EDGE(xxx=1);".to_string(),
+            ])
+            .await
+            .expect_err("invalid route in batch should fail");
+        assert!(
+            err.to_string().contains("ROUTE_INVALID"),
+            "expected ROUTE_INVALID, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_accepts_for_edge_group_suffix() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 新规范增加 FOR EDGE(group_id=...) 路由形态
+        // - 目的: 锁定 group 路由尾缀可被正确剥离并执行
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 方案A要求在执行前校验目标存在
+        // - 目的: 用最小系统表数据保障“存在时可通过”语义
+        let router = Router::new_for_test(true);
+        let setup = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS sys_edge_group(group_id TEXT PRIMARY KEY) FOR HUB;"
+                    .to_string(),
+            )
+            .await;
+        assert!(
+            setup.is_ok(),
+            "failed to create sys_edge_group, got {setup:?}"
+        );
+        let seed = router
+            .write("INSERT INTO sys_edge_group(group_id) VALUES ('12') FOR HUB;".to_string())
+            .await;
+        assert!(seed.is_ok(), "failed to seed sys_edge_group, got {seed:?}");
+        let res = router
+            .write("CREATE TABLE IF NOT EXISTS edge_group_ok(id INTEGER) FOR EDGE(group_id=12);".to_string())
+            .await;
+        assert!(
+            res.is_ok(),
+            "expected FOR EDGE(group_id=...) to be accepted, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_for_edge_group_when_target_not_found() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 方案A要求补齐目标存在性校验
+        // - 目的: 锁定 group_id 不存在时必须返回 TARGET_NOT_FOUND
+        let router = Router::new_for_test(true);
+        let setup = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS sys_edge_group(group_id TEXT PRIMARY KEY) FOR HUB;"
+                    .to_string(),
+            )
+            .await;
+        assert!(
+            setup.is_ok(),
+            "failed to create sys_edge_group, got {setup:?}"
+        );
+        let err = router
+            .write("CREATE TABLE IF NOT EXISTS edge_group_miss(id INTEGER) FOR EDGE(group_id=404);".to_string())
+            .await
+            .expect_err("missing group target should fail");
+        assert!(
+            err.to_string().contains("TARGET_NOT_FOUND"),
+            "expected TARGET_NOT_FOUND, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_for_edge_device_when_target_not_found() {
+        // ### 修改记录 (2026-03-11)
+        // - 原因: 计划要求补齐 device 目标不存在场景
+        // - 目的: 保证 device/group 两类 EDGE 路由错误语义一致
+        let router = Router::new_for_test(true);
+        let setup = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS sys_edge_device(device_id TEXT PRIMARY KEY) FOR HUB;"
+                    .to_string(),
+            )
+            .await;
+        assert!(
+            setup.is_ok(),
+            "failed to create sys_edge_device, got {setup:?}"
+        );
+        let err = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS edge_device_miss(id INTEGER) FOR EDGE(device_id=dev-404);"
+                    .to_string(),
+            )
+            .await
+            .expect_err("missing device target should fail");
+        assert!(
+            err.to_string().contains("TARGET_NOT_FOUND"),
+            "expected TARGET_NOT_FOUND, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_batch_rejects_for_edge_device_when_target_not_found() {
+        // ### 修改记录 (2026-03-11)
+        // - 原因: 批量入口也需要覆盖 device 目标不存在场景
+        // - 目的: 防止 write 与 write_batch 在目标校验上出现行为分叉
+        let router = Router::new_for_test(true);
+        let setup = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS sys_edge_device(device_id TEXT PRIMARY KEY) FOR HUB;"
+                    .to_string(),
+            )
+            .await;
+        assert!(
+            setup.is_ok(),
+            "failed to create sys_edge_device, got {setup:?}"
+        );
+        let err = router
+            .write_batch(vec![
+                "CREATE TABLE IF NOT EXISTS batch_device_ok(id INTEGER) FOR HUB;".to_string(),
+                "INSERT INTO batch_device_ok(id) VALUES (1) FOR EDGE(device_id=dev-404);"
+                    .to_string(),
+            ])
+            .await
+            .expect_err("missing device target in batch should fail");
+        assert!(
+            err.to_string().contains("TARGET_NOT_FOUND"),
+            "expected TARGET_NOT_FOUND, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_batch_rejects_for_edge_group_when_target_not_found() {
+        // ### 修改记录 (2026-03-11)
+        // - 原因: 需要补齐 batch 在 group 目标不存在时的行为覆盖
+        // - 目的: 保证 device/group 在批量入口上的错误语义一致
+        let router = Router::new_for_test(true);
+        let setup = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS sys_edge_group(group_id TEXT PRIMARY KEY) FOR HUB;"
+                    .to_string(),
+            )
+            .await;
+        assert!(
+            setup.is_ok(),
+            "failed to create sys_edge_group, got {setup:?}"
+        );
+        let err = router
+            .write_batch(vec![
+                "CREATE TABLE IF NOT EXISTS batch_group_ok(id INTEGER) FOR HUB;".to_string(),
+                "INSERT INTO batch_group_ok(id) VALUES (1) FOR EDGE(group_id=404);".to_string(),
+            ])
+            .await
+            .expect_err("missing group target in batch should fail");
+        assert!(
+            err.to_string().contains("TARGET_NOT_FOUND"),
+            "expected TARGET_NOT_FOUND, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_for_edge_device_when_metadata_table_missing() {
+        let router = Router::new_for_test(true);
+        let err = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS edge_device_meta_missing(id INTEGER) FOR EDGE(device_id=dev-404);"
+                    .to_string(),
+            )
+            .await
+            .expect_err("missing sys_edge_device table should fail");
+        assert!(
+            err.to_string().contains("TARGET_METADATA_MISSING"),
+            "expected TARGET_METADATA_MISSING, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_batch_rejects_for_edge_group_when_metadata_table_missing() {
+        let router = Router::new_for_test(true);
+        let err = router
+            .write_batch(vec![
+                "CREATE TABLE IF NOT EXISTS batch_meta_missing(id INTEGER) FOR HUB;".to_string(),
+                "INSERT INTO batch_meta_missing(id) VALUES (1) FOR EDGE(group_id=404);".to_string(),
+            ])
+            .await
+            .expect_err("missing sys_edge_group table in batch should fail");
+        assert!(
+            err.to_string().contains("TARGET_METADATA_MISSING"),
+            "expected TARGET_METADATA_MISSING, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_for_edge_group_when_metadata_table_missing() {
+        // ### 修改记录 (2026-03-12)
+        // - 原因: 当前仅覆盖了 write/device 与 write_batch/group 的缺表场景
+        // - 目的: 补齐 write/group 缺失 sys_edge_group 的对称回归覆盖
+        let router = Router::new_for_test(true);
+        let err = router
+            .write(
+                "CREATE TABLE IF NOT EXISTS edge_group_meta_missing(id INTEGER) FOR EDGE(group_id=404);"
+                    .to_string(),
+            )
+            .await
+            .expect_err("missing sys_edge_group table should fail");
+        assert!(
+            err.to_string().contains("TARGET_METADATA_MISSING"),
+            "expected TARGET_METADATA_MISSING, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_sys_column_consistency_key_eventual_insert() {
+        // ### 修改记录 (2026-03-10)
+        // - 原因: 系统表约束要求 is_key_column=1 的一致性必须是 strong
+        // - 目的: 锁定元数据写入路径的硬约束行为
+        let router = Router::new_for_test(true);
+        let err = router
+            .write(
+                "INSERT INTO sys_column_consistency(schema_name, table_name, column_name, consistency_level, is_key_column) VALUES ('main', 't', 'id', 'eventual', 1) FOR HUB;"
+                    .to_string(),
+            )
+            .await
+            .expect_err("sys_column_consistency key eventual should fail");
+        assert!(
+            err.to_string().contains("COLUMN_CONSISTENCY_INVALID"),
+            "expected COLUMN_CONSISTENCY_INVALID, got {err}"
+        );
     }
 }

@@ -15,7 +15,9 @@ param(
     [string]$PauseBeforeCommitMsList = "1000,4000,8000",
     [string]$Mode = "quorum",
     [int]$VerifyRepeatCount = 3,
-    [bool]$ResetDbFiles = $true
+    [bool]$ResetDbFiles = $true,
+    [int]$LeaderRetryMaxAttempts = 8,
+    [int]$LeaderRetryDelayMs = 1000
 )
 
 $env:CARGO_TARGET_DIR = "target_new"
@@ -35,9 +37,9 @@ function Reset-DbFiles {
         return
     }
     Write-Host ">>> Cleaning DB files..." -ForegroundColor Yellow
-    Remove-Item -Path "master.db","slave1.db","slave2.db" -ErrorAction SilentlyContinue
-    Remove-Item -Path "master.db-wal","slave1.db-wal","slave2.db-wal" -ErrorAction SilentlyContinue
-    Remove-Item -Path "master.db-shm","slave1.db-shm","slave2.db-shm" -ErrorAction SilentlyContinue
+    Remove-Item -Path "master.db","slave1.db","slave2.db" -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Path "master.db-wal","slave1.db-wal","slave2.db-wal" -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Path "master.db-shm","slave1.db-shm","slave2.db-shm" -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 function Stop-AllServers {
@@ -88,7 +90,7 @@ function Run-ClientFull {
         $clientArgs += @("--pause-before-commit-ms",$PauseMs)
     }
     Write-Host ">>> Running Client (full)..." -ForegroundColor Cyan
-    cargo @clientArgs
+    Invoke-ClientWithLeaderRetry -ClientArgs $clientArgs -ScenarioLabel "full"
 }
 
 function Run-ClientVerifyOnly {
@@ -103,7 +105,33 @@ function Run-ClientVerifyOnly {
         "--scenario","verify-only"
     )
     Write-Host ">>> Running Client (verify-only)..." -ForegroundColor Cyan
-    cargo @clientArgs
+    Invoke-ClientWithLeaderRetry -ClientArgs $clientArgs -ScenarioLabel "verify-only"
+}
+
+function Invoke-ClientWithLeaderRetry {
+    param(
+        [string[]]$ClientArgs,
+        [string]$ScenarioLabel
+    )
+    for ($attempt = 1; $attempt -le $LeaderRetryMaxAttempts; $attempt++) {
+        if ($attempt -gt 1) {
+            Write-Host ">>> Retrying client scenario '$ScenarioLabel' ($attempt/$LeaderRetryMaxAttempts)..." -ForegroundColor Yellow
+        }
+        $output = & cargo @ClientArgs 2>&1
+        $exitCode = $LASTEXITCODE
+        $output | ForEach-Object { Write-Host $_ }
+        if ($exitCode -eq 0) {
+            return
+        }
+        $outputText = ($output | Out-String)
+        $isLeaderUnknown = $outputText -match "Not leader and leader address unknown"
+        if ($isLeaderUnknown -and $attempt -lt $LeaderRetryMaxAttempts) {
+            Start-Sleep -Milliseconds $LeaderRetryDelayMs
+            continue
+        }
+        throw "Client scenario '$ScenarioLabel' failed with exit code $exitCode."
+    }
+    throw "Client scenario '$ScenarioLabel' exhausted retry limit ($LeaderRetryMaxAttempts)."
 }
 
 function Wait-ForClientPauseLog {
@@ -368,6 +396,17 @@ function Run-ScenarioRepeatVerify3x {
     Stop-AllServers
 }
 
+function Run-ScenarioVerifyOnly {
+    Reset-DbFiles
+    Stop-AllServers
+    $procs = Start-Servers
+    if ($ResetDbFiles) {
+        Run-ClientFull
+    }
+    Run-ClientVerifyOnly
+    Stop-AllServers
+}
+
 Write-Host ">>> Building Project..." -ForegroundColor Cyan
 cargo build
 if ($LASTEXITCODE -ne 0) {
@@ -375,18 +414,23 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-switch ($Scenario) {
-    "full" { Run-ScenarioFull }
-    "restart_single_node" { Run-ScenarioRestartSingleNode }
-    "prepare_commit_kill" { Run-ScenarioPrepareCommitKill }
-    "prepare_commit_kill_matrix" { Run-ScenarioPrepareCommitKillMatrix }
-    "chaos_prepare_commit_kill_matrix" { Run-ScenarioPrepareCommitKillMatrix }
-    "chaos_prepare_commit_alternate" { Run-ScenarioChaosPrepareCommitAlternate }
-    "repeat_verify_3x" { Run-ScenarioRepeatVerify3x }
-    "chaos_multi_restart" { Run-ScenarioChaosMultiRestart }
-    "chaos_mixed_faults" { Run-ScenarioChaosMixedFaults }
-    default {
-        Write-Host "Unknown scenario '$Scenario', fallback to full." -ForegroundColor Yellow
-        Run-ScenarioFull
+try {
+    switch ($Scenario) {
+        "full" { Run-ScenarioFull }
+        "verify-only" { Run-ScenarioVerifyOnly }
+        "restart_single_node" { Run-ScenarioRestartSingleNode }
+        "prepare_commit_kill" { Run-ScenarioPrepareCommitKill }
+        "prepare_commit_kill_matrix" { Run-ScenarioPrepareCommitKillMatrix }
+        "chaos_prepare_commit_kill_matrix" { Run-ScenarioPrepareCommitKillMatrix }
+        "chaos_prepare_commit_alternate" { Run-ScenarioChaosPrepareCommitAlternate }
+        "repeat_verify_3x" { Run-ScenarioRepeatVerify3x }
+        "chaos_multi_restart" { Run-ScenarioChaosMultiRestart }
+        "chaos_mixed_faults" { Run-ScenarioChaosMixedFaults }
+        default {
+            throw "Unknown scenario '$Scenario'."
+        }
     }
+}
+finally {
+    Stop-AllServers
 }

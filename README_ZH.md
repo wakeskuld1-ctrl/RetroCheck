@@ -210,6 +210,84 @@ cargo run --bin client -- --master-addr http://127.0.0.1:50051 --slave-addrs htt
 - `--port <u16>`：gRPC 监听端口。
 - `--db <path>`：SQLite 数据文件路径。
 - `--engine <name>`：存储引擎（默认 `sqlite`）。
+- `--addhub <host:port>`：一键新增节点（Hub/Edge 当前统一走 AddHub 流程）。
+- `--removehub <host:port>`：一键移除 Hub 节点（自动执行 `MARK_DRAINING -> COMMIT`）。
+- `--removeedge <host:port>`：一键移除 Edge 节点（自动执行 `MARK_DRAINING -> COMMIT`）。
+- `--admin <url>`：管理面入口地址（默认 `http://127.0.0.1:50051`）。
+- `--node-id <u64>`：显式指定节点 ID（建议在生产环境使用，避免地址哈希偏差）。
+
+### Hub / Edge 节点增删命令
+```bash
+# 新增 Hub（也可用于新增 Edge，当前统一走 --addhub）
+cargo run --bin server -- --addhub 192.168.23.2:9060 --admin http://127.0.0.1:50051
+
+# 新增 Edge（当前与新增 Hub 命令一致）
+cargo run --bin server -- --addhub 192.168.23.3:9060 --admin http://127.0.0.1:50051
+
+# 移除 Hub
+cargo run --bin server -- --removehub 192.168.23.2:9060 --admin http://127.0.0.1:50051
+
+# 移除 Edge
+cargo run --bin server -- --removeedge 192.168.23.3:9060 --admin http://127.0.0.1:50051
+```
+
+### 统一 SQL 语法（草案）
+- 目标：客户端只使用 SQL，不区分 Hub/Edge 的底层存储实现。
+- 原则：触发器、存储过程不做；尽量与 SQLite 原生语义一致；SQLite 本身不支持或受限的能力不做增强。
+- 路由扩展：在 SQL 末尾追加路由后缀，不改写 SQL 主体语法。
+
+#### 1) 路由后缀
+- `FOR HUB`：语句在 Hub 执行。
+- `FOR EDGE(device_id=xxx)`：语句在指定 Edge 设备执行。
+- `FOR EDGE(device_id=all)`：语句在全量 Edge 编组执行。
+
+#### 2) 一致性规则
+- 默认一致性：`strong`（强一致）。
+- 字段级覆盖：允许在列定义后加注释标签 `/* consistency:eventual */`，表示该字段采用最终一致策略。
+- 说明：若未标注字段级策略，则继承表级默认策略（当前默认 strong）。
+
+#### 3) DDL 对应关系
+- 支持：`CREATE TABLE`、`DROP TABLE`、`ALTER TABLE ADD COLUMN`（按 SQLite 原生能力）。
+- 不扩展：`TRIGGER`、`PROCEDURE`、`FUNCTION`、复杂 DDL 方言增强。
+- 示例：
+
+```sql
+CREATE TABLE orders (
+  id TEXT PRIMARY KEY,
+  amount INTEGER NOT NULL
+) FOR HUB;
+
+CREATE TABLE telemetry (
+  id TEXT PRIMARY KEY /* consistency:strong */,
+  temperature REAL /* consistency:eventual */,
+  humidity REAL /* consistency:eventual */
+) FOR EDGE(device_id=all);
+
+DROP TABLE telemetry FOR EDGE(device_id=all);
+```
+
+#### 4) DML 对应关系
+- 支持：`INSERT`、`UPDATE`、`DELETE`、`SELECT`（按 SQLite 原生语义）。
+- 示例：
+
+```sql
+INSERT INTO orders(id, amount) VALUES ('A001', 100) FOR HUB;
+
+INSERT INTO telemetry(id, temperature, humidity)
+VALUES ('dev-01', 28.6, 61.0) FOR EDGE(device_id=3201);
+
+UPDATE telemetry
+SET temperature = 29.1
+WHERE id = 'dev-01'
+FOR EDGE(device_id=3201);
+
+SELECT id, amount FROM orders WHERE id = 'A001' FOR HUB;
+```
+
+#### 5) 明确不做（本阶段）
+- 不做触发器（`CREATE TRIGGER`）与存储过程。
+- 不做 SQLite 未支持特性的兼容增强（例如某些版本下的 DDL 变更限制）。
+- 不做 SQL 外的第二套业务 DSL；客户端入口保持 SQL 统一。
 
 ### Client CLI
 - `--scenario <full|verify-only>`：执行完整流程或仅一致性校验。
