@@ -621,6 +621,24 @@ mod tests {
         let commands = build_ai_downlink_commands(320, &records);
         assert!(commands.is_empty());
     }
+
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 需要验证 Session 固定 TTL 不会因 touch 续期
+    // - 目的: 避免 last_seen_ms 影响 created_at 的过期语义
+    #[test]
+    fn session_ttl_fixed_does_not_extend_on_touch() {
+        // ### 修改记录 (2026-03-14)
+        // - 原因: 需要最小 TTL 场景便于断言
+        // - 目的: 确保超时后返回 expired
+        let mut sm = SessionManager::new(100);
+        let sid = sm.create(1, vec![1], 0);
+        // ### 修改记录 (2026-03-14)
+        // - 原因: 需要模拟中途访问
+        // - 目的: 验证 touch 仅更新 last_seen_ms
+        sm.touch(sid, 50).expect("touch should succeed");
+        let err = sm.get_by_id(sid, 101).unwrap_err();
+        assert!(err.to_string().contains("expired"));
+    }
 }
 
 struct NoncePersistence {
