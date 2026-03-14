@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
@@ -21,7 +21,7 @@ use crate::management::order_rules_service::OrderRulesStore;
 use crate::raft::router::Router;
 use flatbuffers::FlatBufferBuilder;
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use uuid::Uuid;
 
 pub type SessionId = u64;
@@ -1739,10 +1739,16 @@ fn spawn_ordering_worker(
 
 pub struct EdgeGateway {
     addr: String,
+    // ### 修改记录 (2026-03-14)
+    // - 原因: std::sync::Mutex 会阻塞 async 运行时线程
+    // - 目的: 使用 tokio::sync::Mutex 让锁等待可让出执行权
     sessions: Arc<Mutex<SessionManager>>,
     nonce_cache: Arc<Mutex<NonceCache>>,
     ttl_ms: u64,
     secret_key: Vec<u8>,
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 黑名单维护也需要避免阻塞 async 线程
+    // - 目的: 统一使用 tokio::sync::Mutex
     blacklist: Arc<Mutex<Blacklist>>,
     concurrency_limit: Arc<Semaphore>,
     // ### 修改记录 (2026-03-01)
@@ -1907,21 +1913,21 @@ impl EdgeGateway {
                             Ok(d) => d.as_millis() as u64,
                             Err(_) => continue,
                         };
+                    // ### 修改记录 (2026-03-14)
+                    // - 原因: async 环境中 std::sync::Mutex 会阻塞线程
+                    // - 目的: 使用 tokio::sync::Mutex 的异步锁
                     {
-                        let mut sessions = match sessions.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
+                        let mut sessions = sessions.lock().await;
                         let count = sessions.cleanup_expired(now_ms);
                         if count > 0 {
                             println!("GC: cleaned up {} expired sessions", count);
                         }
                     }
+                    // ### 修改记录 (2026-03-14)
+                    // - 原因: 黑名单清理也需要非阻塞锁
+                    // - 目的: 与会话清理保持一致
                     {
-                        let mut bl = match blacklist.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
+                        let mut bl = blacklist.lock().await;
                         bl.cleanup();
                     }
                 }
@@ -2207,10 +2213,10 @@ impl EdgeGateway {
         let peer_addr = socket.peer_addr().ok();
 
         if let Some(addr) = peer_addr {
-            let mut bl = match self.blacklist.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            // ### 修改记录 (2026-03-14)
+            // - 原因: 连接入口检查需要异步锁以避免阻塞
+            // - 目的: 使用 tokio::sync::Mutex 读取黑名单
+            let mut bl = self.blacklist.lock().await;
             if bl.is_banned(addr.ip()) {
                 // Silently drop connection
                 return Ok(());
@@ -2260,41 +2266,38 @@ impl EdgeGateway {
                     let lookup_key = |_id: u64| Some(self.secret_key.clone());
 
                     let auth_result = {
-                        let mut sessions = match self.sessions.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        let mut nonce_cache = match self.nonce_cache.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        let res = handle_auth_hello(
+                        // ### 修改记录 (2026-03-14)
+                        // - 原因: 会话与 nonce 缓存需要异步锁
+                        // - 目的: 避免阻塞 tokio 运行时线程
+                        let mut sessions = self.sessions.lock().await;
+                        let mut nonce_cache = self.nonce_cache.lock().await;
+                        handle_auth_hello(
                             &payload,
                             self.ttl_ms,
                             &mut sessions,
                             &mut nonce_cache,
                             lookup_key,
                             now_ms,
-                        );
-
-                        // ### 修改记录 (2026-03-01)
-                        // - 原因: clippy 提示可合并条件判断
-                        // - 目的: 保持黑名单逻辑不变并提升可读性
-                        if let Err(e) = &res
-                            && let Some(addr) = peer_addr
-                        {
-                            let err_msg = e.to_string();
-                            if err_msg.contains("signature mismatch")
-                                || err_msg.contains("Invalid AuthHello")
-                            {
-                                match self.blacklist.lock() {
-                                    Ok(mut guard) => guard.record_failure(addr.ip()),
-                                    Err(poisoned) => poisoned.into_inner().record_failure(addr.ip()),
-                                }
-                            }
-                        }
-                        res
+                        )
                     };
+
+                    // ### 修改记录 (2026-03-01)
+                    // - 原因: clippy 提示可合并条件判断
+                    // - 目的: 保持黑名单逻辑不变并提升可读性
+                    // ### 修改记录 (2026-03-14)
+                    // - 原因: 黑名单记录需要异步锁，且不应持有会话锁时等待
+                    // - 目的: 避免锁顺序风险并缩短锁持有时间
+                    if let Err(e) = &auth_result
+                        && let Some(addr) = peer_addr
+                    {
+                        let err_msg = e.to_string();
+                        if err_msg.contains("signature mismatch")
+                            || err_msg.contains("Invalid AuthHello")
+                        {
+                            let mut bl = self.blacklist.lock().await;
+                            bl.record_failure(addr.ip());
+                        }
+                    }
 
                     let response_payload = match auth_result {
                         Ok(payload) => payload,
@@ -2329,37 +2332,17 @@ impl EdgeGateway {
                         .as_millis() as u64;
 
                     let session_result = {
-                        let mut sessions = match self.sessions.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        let mut nonce_cache = match self.nonce_cache.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
+                        // ### 修改记录 (2026-03-14)
+                        // - 原因: Session / Nonce 访问需要异步锁
+                        // - 目的: 避免在 tokio 运行时内阻塞
+                        let mut sessions = self.sessions.lock().await;
+                        let mut nonce_cache = self.nonce_cache.lock().await;
                         let res = handle_session_request(
                             &payload,
                             &mut sessions,
                             &mut nonce_cache,
                             now_ms,
                         );
-
-                        // ### 修改记录 (2026-03-01)
-                        // - 原因: clippy 提示可合并条件判断
-                        // - 目的: 保持黑名单逻辑不变并提升可读性
-                        if let Err(e) = &res
-                            && let Some(addr) = peer_addr
-                        {
-                            let err_msg = e.to_string();
-                            if err_msg.contains("signature mismatch")
-                                || err_msg.contains("Invalid SessionRequest")
-                            {
-                                match self.blacklist.lock() {
-                                    Ok(mut guard) => guard.record_failure(addr.ip()),
-                                    Err(poisoned) => poisoned.into_inner().record_failure(addr.ip()),
-                                }
-                            }
-                        }
 
                         match res {
                             Ok((req, sid, nonce, device_id)) => {
@@ -2375,6 +2358,24 @@ impl EdgeGateway {
                             Err(e) => Err(e),
                         }
                     };
+
+                    // ### 修改记录 (2026-03-01)
+                    // - 原因: clippy 提示可合并条件判断
+                    // - 目的: 保持黑名单逻辑不变并提升可读性
+                    // ### 修改记录 (2026-03-14)
+                    // - 原因: 黑名单记录不应与会话锁交叉持有
+                    // - 目的: 降低锁等待风险
+                    if let Err(e) = &session_result
+                        && let Some(addr) = peer_addr
+                    {
+                        let err_msg = e.to_string();
+                        if err_msg.contains("signature mismatch")
+                            || err_msg.contains("Invalid SessionRequest")
+                        {
+                            let mut bl = self.blacklist.lock().await;
+                            bl.record_failure(addr.ip());
+                        }
+                    }
 
                     let (req, session_id, nonce, session_key, device_id) = match session_result {
                         Ok(data) => data,
