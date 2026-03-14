@@ -190,11 +190,22 @@ impl ClusterNodeManager {
     }
 
     async fn ensure_leader_or_redirect(&self) -> Result<Option<String>> {
-        let leader_id = self.wait_for_leader().await?;
-        if leader_id == self.local_node_id {
-            return Ok(None);
+        // ### 修改记录 (2026-03-14)
+        // - 原因: 无 leader 时 wait_for_leader 会直接报错
+        // - 目的: 让 add_hub 能返回 NOT_LEADER + leader_hint
+        let leader_id = self.current_leader_id().await?;
+        if let Some(leader_id) = leader_id {
+            if leader_id == self.local_node_id {
+                return Ok(None);
+            }
+            return Ok(Some(self.resolve_leader_hint(leader_id).await));
         }
-        Ok(Some(self.resolve_leader_hint(leader_id).await))
+
+        // ### 修改记录 (2026-03-14)
+        // - 原因: 尚未选主时仍需返回可解析的重定向
+        // - 目的: 使用 leader_node 作为回退 hint
+        let fallback_id = self.leader_node.node_id();
+        Ok(Some(self.resolve_leader_hint(fallback_id).await))
     }
 
     async fn precheck_add(
