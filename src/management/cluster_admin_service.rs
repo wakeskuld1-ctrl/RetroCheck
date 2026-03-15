@@ -1,11 +1,16 @@
 use crate::pb::cluster_admin_server::ClusterAdmin;
-use crate::pb::{AddEdgeRequest, AddEdgeResponse, AddHubRequest, AddHubResponse, NodeCompatibility, RemoveHubRequest, RemoveHubResponse};
+use crate::pb::raft_service_server::RaftServiceServer;
+use crate::pb::{
+    AddEdgeRequest, AddEdgeResponse, AddHubRequest, AddHubResponse, NodeCompatibility,
+    RemoveHubRequest, RemoveHubResponse,
+};
 use crate::management::cluster_admin_domain::{
     AddHubError, CompatibilityChecker, StrictCompatibilityChecker, TopologyService,
     add_hub_error_response, default_compatibility as domain_default_compatibility,
     global_topology_service, normalize_grpc_addr, not_leader_response, remove_hub_not_leader_response,
     remove_hub_response,
 };
+use crate::raft::grpc_service::RaftServiceImpl;
 use crate::raft::network::RaftRouter;
 use crate::raft::raft_node::RaftNode;
 use anyhow::{Result, anyhow};
@@ -13,7 +18,10 @@ use openraft::{BasicNode, ServerState};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -395,6 +403,17 @@ async fn precheck_add(
                 "set grpc_addr to a reachable grpc endpoint",
             ));
         }
+        // ### 修改记录 (2026-03-15)
+        // - 原因: gRPC 与 Raft 必须使用同一端口，否则会导致网络不一致
+        // - 目的: 在入口处校验地址一致性，提前返回 INVALID_ARGUMENT
+        let normalized_raft_addr = normalize_grpc_addr(req.raft_addr.trim().to_string());
+        let normalized_grpc_addr = normalize_grpc_addr(req.grpc_addr.trim().to_string());
+        if normalized_raft_addr != normalized_grpc_addr {
+            return Err(AddHubError::invalid_argument(
+                "raft_addr and grpc_addr must be identical",
+                "set grpc_addr to match raft_addr exactly",
+            ));
+        }
 
         let state = self.state.lock().await;
         if let Some(cached) = state.add_request_cache.get(&req.request_id) {
@@ -517,6 +536,33 @@ async fn precheck_add(
                     "check node runtime and storage path permissions",
                 )
             })?;
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 新节点需要对外提供 Raft gRPC 服务，否则 add_learner 会阻塞
+        // - 目的: 在 add_hub 中启动 Raft gRPC server，确保网络链路可用
+        let raw_grpc_addr = req.grpc_addr.trim();
+        let bind_addr = raw_grpc_addr
+            .strip_prefix("http://")
+            .or_else(|| raw_grpc_addr.strip_prefix("https://"))
+            .unwrap_or(raw_grpc_addr)
+            .to_string();
+        let listener = TcpListener::bind(bind_addr.as_str())
+            .await
+            .map_err(|e| {
+                AddHubError::invalid_argument(
+                    format!("failed to bind grpc_addr {}: {}", req.grpc_addr, e),
+                    "ensure grpc_addr is a free host:port and matches raft_addr",
+                )
+            })?;
+        let service = RaftServiceImpl::new(node.clone());
+        tokio::spawn(async move {
+            let server = Server::builder().add_service(RaftServiceServer::new(service));
+            if let Err(err) = server
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+            {
+                eprintln!("raft grpc server failed: {}", err);
+            }
+        });
         self.raft_router.register(req.node_id, Arc::new(node.clone()));
 
         self.leader_node
@@ -983,6 +1029,14 @@ async fn precheck_add(
     pub async fn node_count(&self) -> usize {
         let state = self.state.lock().await;
         state.nodes.len()
+    }
+
+    /// ### 修改记录 (2026-03-15)
+    /// - 原因: 测试需要访问新增节点以启动 gRPC 服务
+    /// - 目的: 提供只读节点句柄查询入口
+    pub async fn node_for_test(&self, node_id: u64) -> Option<Arc<RaftNode>> {
+        let state = self.state.lock().await;
+        state.nodes.get(&node_id).cloned()
     }
 
     pub async fn register_known_grpc_addr(&self, node_id: u64, grpc_addr: String) {

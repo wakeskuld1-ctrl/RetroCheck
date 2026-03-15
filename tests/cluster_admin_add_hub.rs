@@ -4,14 +4,67 @@ use check_program::management::cluster_admin_service::{
     EdgeMetadataError, EdgeMetadataProvider, default_compatibility,
 };
 use check_program::pb::cluster_admin_server::ClusterAdmin;
+use check_program::pb::raft_service_server::RaftServiceServer;
 use check_program::pb::{AddEdgeRequest, AddHubRequest, NodeCompatibility, RemoveHubRequest};
+use check_program::raft::grpc_service::RaftServiceImpl;
 use check_program::raft::network::RaftRouter;
 use check_program::raft::raft_node::RaftNode;
-use openraft::ServerState;
+use openraft::{BasicNode, ChangeMembers, ServerState};
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
+use tonic::transport::Server;
 use uuid::Uuid;
+
+/// ### 修改记录 (2026-03-15)
+/// - 原因: 需要为 gRPC 网络测试启动 RaftService
+/// - 目的: 提供 leader/learner 的 Raft RPC 通信入口
+async fn spawn_raft_grpc_server(node: &RaftNode) -> SocketAddr {
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 测试需要随机端口避免冲突
+    // - 目的: 保持并行测试稳定
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind leader raft grpc");
+    let addr = listener
+        .local_addr()
+        .expect("leader raft grpc addr");
+    spawn_raft_grpc_server_with_listener(node, listener).await;
+    addr
+}
+
+/// ### 修改记录 (2026-03-15)
+/// - 原因: follower 监听端口需要提前占用
+/// - 目的: 复用既有 listener 启动 RaftService
+async fn spawn_raft_grpc_server_with_listener(node: &RaftNode, listener: TcpListener) {
+    let service = RaftServiceImpl::new(node.clone());
+    tokio::spawn(async move {
+        let server = Server::builder().add_service(RaftServiceServer::new(service));
+        server
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("raft grpc server failed");
+    });
+}
+
+/// ### 修改记录 (2026-03-15)
+/// - 原因: add_hub 现在会绑定 gRPC 端口，静态端口易冲突
+/// - 目的: 为测试动态分配可用端口并保持同端口约束
+async fn allocate_local_addr() -> String {
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要从系统申请空闲端口
+    // - 目的: 返回可直接用于 gRPC 绑定的地址
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral addr");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    addr.to_string()
+}
 
 struct MockDrainSignal {
     draining: AtomicBool,
@@ -128,10 +181,14 @@ async fn add_hub_idempotent_with_same_request_id() {
         topology,
     );
 
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let node_addr = allocate_local_addr().await;
     let request = AddHubRequest {
         node_id: 2,
-        raft_addr: "127.0.0.1:31002".to_string(),
-        grpc_addr: "127.0.0.1:32002".to_string(),
+        raft_addr: node_addr.clone(),
+        grpc_addr: node_addr,
         auto_promote: false,
         request_id: "rid-1".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
@@ -147,6 +204,56 @@ async fn add_hub_idempotent_with_same_request_id() {
             .iter()
             .any(|event| event.action == "cluster.add_hub" && event.status == "ok")
     );
+}
+
+// ### 修改记录 (2026-03-15)
+// - 原因: 需要验证 raft_addr 与 grpc_addr 必须一致的约束
+// - 目的: 不一致时返回 INVALID_ARGUMENT，避免不可用节点加入
+#[tokio::test]
+async fn add_hub_rejects_mismatched_grpc_addr() {
+    let topology = Arc::new(MemoryTopologyService::default());
+    let router = RaftRouter::new();
+    let base_dir = std::env::temp_dir().join(format!("cluster_admin_mismatch_{}", Uuid::new_v4()));
+    let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
+    router.register(1, Arc::new(leader.clone()));
+    let manager = ClusterNodeManager::new_with_topology(
+        1,
+        "http://127.0.0.1:50051".to_string(),
+        Arc::new(leader),
+        router.clone(),
+        ClusterBaseline {
+            app_semver: env!("CARGO_PKG_VERSION").to_string(),
+            sqlite_schema_version: 1,
+            sled_format_version: 1,
+            log_codec_version: 1,
+        },
+        topology,
+    );
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 覆盖地址不一致的非法输入场景
+    // - 目的: 触发 INVALID_ARGUMENT 返回路径
+    let raft_addr = allocate_local_addr().await;
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确保 grpc_addr 与 raft_addr 不一致
+    // - 目的: 避免偶发相同端口导致测试不稳定
+    let mut grpc_addr = allocate_local_addr().await;
+    if grpc_addr == raft_addr {
+        grpc_addr = allocate_local_addr().await;
+    }
+    let request = AddHubRequest {
+        node_id: 2,
+        raft_addr,
+        grpc_addr,
+        auto_promote: false,
+        request_id: "rid-mismatch-addr".to_string(),
+        compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
+    };
+
+    let result = manager.add_hub(request).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.reason_code(), "INVALID_ARGUMENT");
 }
 
 #[tokio::test]
@@ -165,6 +272,9 @@ async fn add_hub_reject_when_sqlite_schema_mismatch() {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
+    // - ??: ?? new_with_topology ??????
+    // - ??: ????? leader ??
+    // ### ???? (2026-03-15)
     let manager = Arc::new(ClusterNodeManager::new_with_topology(
         1,
         "http://127.0.0.1:50051".to_string(),
@@ -179,10 +289,14 @@ async fn add_hub_reject_when_sqlite_schema_mismatch() {
         topology,
     ));
     let service = ClusterAdminService::new(manager.clone());
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let node_addr = allocate_local_addr().await;
     let req = AddHubRequest {
         node_id: 3,
-        raft_addr: "127.0.0.1:31003".to_string(),
-        grpc_addr: "127.0.0.1:32003".to_string(),
+        raft_addr: node_addr.clone(),
+        grpc_addr: node_addr,
         auto_promote: false,
         request_id: "rid-schema-mismatch".to_string(),
         compatibility: Some(NodeCompatibility {
@@ -234,10 +348,14 @@ async fn add_hub_on_follower_returns_real_leader_hint() {
         .await;
     let service = ClusterAdminService::new(manager.clone());
 
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let node_addr = allocate_local_addr().await;
     let req = AddHubRequest {
         node_id: 4,
-        raft_addr: "127.0.0.1:31004".to_string(),
-        grpc_addr: "127.0.0.1:32004".to_string(),
+        raft_addr: node_addr.clone(),
+        grpc_addr: node_addr,
         auto_promote: false,
         request_id: "rid-redirect".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
@@ -286,10 +404,14 @@ async fn add_hub_on_follower_fallback_then_resolve_real_leader_hint() {
     ));
     let service = ClusterAdminService::new(manager.clone());
 
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let first_addr = allocate_local_addr().await;
     let first_req = AddHubRequest {
         node_id: 5,
-        raft_addr: "127.0.0.1:31005".to_string(),
-        grpc_addr: "127.0.0.1:32005".to_string(),
+        raft_addr: first_addr.clone(),
+        grpc_addr: first_addr,
         auto_promote: false,
         request_id: "rid-redirect-fallback-1".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
@@ -306,10 +428,14 @@ async fn add_hub_on_follower_fallback_then_resolve_real_leader_hint() {
         .register_known_grpc_addr(1, "127.0.0.1:50051".to_string())
         .await;
 
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let second_addr = allocate_local_addr().await;
     let second_req = AddHubRequest {
         node_id: 6,
-        raft_addr: "127.0.0.1:31006".to_string(),
-        grpc_addr: "127.0.0.1:32006".to_string(),
+        raft_addr: second_addr.clone(),
+        grpc_addr: second_addr,
         auto_promote: false,
         request_id: "rid-redirect-fallback-2".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
@@ -361,10 +487,14 @@ async fn add_hub_redirects_when_leader_not_elected() {
     // ### ???? (2026-03-14)
     // - ??: ???? add_hub ??
     // - ??: ?? ensure_leader_or_redirect
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let node_addr = allocate_local_addr().await;
     let req = AddHubRequest {
         node_id: 7,
-        raft_addr: "127.0.0.1:31007".to_string(),
-        grpc_addr: "127.0.0.1:32007".to_string(),
+        raft_addr: node_addr.clone(),
+        grpc_addr: node_addr,
         auto_promote: false,
         request_id: "rid-no-leader".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
@@ -409,15 +539,28 @@ async fn remove_hub_requires_mark_before_commit() {
     ));
     let service = ClusterAdminService::new(manager.clone());
 
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let node_addr = allocate_local_addr().await;
     let add_req = AddHubRequest {
         node_id: 2,
-        raft_addr: "127.0.0.1:31002".to_string(),
-        grpc_addr: "127.0.0.1:32002".to_string(),
+        raft_addr: node_addr.clone(),
+        grpc_addr: node_addr,
         auto_promote: true,
         request_id: "rid-remove-add".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
     };
-    let _ = service.add_hub(Request::new(add_req)).await.unwrap();
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 路径下 add_hub 可能出现阻塞
+    // - 目的: 使用超时避免测试无期限挂起并定位卡点
+    let _ = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        service.add_hub(Request::new(add_req)),
+    )
+    .await
+    .expect("add_hub timeout")
+    .unwrap();
 
     let commit_without_mark = RemoveHubRequest {
         node_id: 2,
@@ -465,7 +608,6 @@ async fn remove_hub_requires_mark_before_commit() {
 
 // ### ???? (2026-03-15)
 // - ??: ? stash ?? remove_hub ???????
-// - ??: ??????????? leader
 #[tokio::test]
 async fn remove_hub_rejects_commit_when_target_is_current_leader() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -523,9 +665,11 @@ async fn remove_hub_rejects_commit_when_target_is_current_leader() {
     assert_eq!(manager.node_count().await, 1);
 }
 
-// ### ???? (2026-03-15)
-// - ??: ? stash ?? remove_hub ??????
-// - ??: ?? leader ???????
+// ### 修改记录 (2026-03-15)
+// - 原因: 先前该用例被重复标注 #[tokio::test] 导致编译失败
+// - 目的: 移除重复标注以恢复用例可编译性与执行稳定性
+// - 原因: add_hub 已切换 gRPC 网络路径，需同步启动 Raft gRPC 服务
+// - 目的: 确保 leader transfer 与投票 RPC 走同端口 gRPC 通道
 #[tokio::test]
 async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -533,21 +677,70 @@ async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
     let base_dir = std::env::temp_dir().join(
         format!("cluster_admin_remove_auto_transfer_{}", Uuid::new_v4()),
     );
-    let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要定位测试挂起的具体阶段
+    // - 目的: 通过阶段性日志确认执行进度
+    println!("step: start leader");
+    // ### 修改记录 (2026-03-15)
+    // - 原因: add_hub 已迁移至 gRPC 网络路径，leader 需走 gRPC
+    // - 目的: 使用 start_grpc 启动 leader 以符合网络一致性
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 启动 leader 可能因环境问题阻塞
+    // - 目的: 使用超时快速定位启动阶段卡点
+    let leader = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        RaftNode::start_grpc(1, base_dir),
+    )
+    .await
+    .expect("start_grpc leader timeout")
+    .unwrap();
     router.register(1, Arc::new(leader.clone()));
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认 gRPC 服务启动阶段是否完成
+    // - 目的: 输出阶段日志辅助定位卡点
+    println!("step: start leader grpc server");
+    // ### 修改记录 (2026-03-15)
+    // - 原因: leader 需要对外提供 Raft gRPC 通道
+    // - 目的: 启动 gRPC 服务以支持 transfer/vote RPC
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 服务启动也可能因端口占用阻塞
+    // - 目的: 增加超时以便尽快暴露启动问题
+    let leader_addr = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        spawn_raft_grpc_server(&leader),
+    )
+    .await
+    .expect("start leader grpc timeout");
     let mut members = std::collections::BTreeSet::new();
     members.insert(1);
-    leader.raft.initialize(members).await.unwrap();
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认 raft 初始化是否完成
+    // - 目的: 输出阶段日志辅助定位卡点
+    println!("step: initialize leader");
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 初始化 Raft 可能被底层状态机阻塞
+    // - 目的: 通过超时定位初始化卡点
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        leader.raft.initialize(members),
+    )
+    .await
+    .expect("leader initialize timeout")
+    .unwrap();
     for _ in 0..50 {
         if leader.raft.metrics().borrow().state == openraft::ServerState::Leader {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
+    // ### 修改记录 (2026-03-15)
+    // - 原因: ClusterNodeManager 需要持有 leader 句柄
+    // - 目的: 保证管理面操作与 leader 状态同步
+    let leader_for_manager = leader.clone();
     let manager = Arc::new(ClusterNodeManager::new_with_topology(
         1,
-        "http://127.0.0.1:50051".to_string(),
-        Arc::new(leader),
+        format!("http://{}", leader_addr),
+        Arc::new(leader_for_manager),
         router.clone(),
         ClusterBaseline {
             app_semver: env!("CARGO_PKG_VERSION").to_string(),
@@ -559,15 +752,63 @@ async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
     ));
     let service = ClusterAdminService::new(manager.clone());
 
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认 add_hub 前置准备完成
+    // - 目的: 输出阶段日志辅助定位卡点
+    // - 原因: add_hub 不再预绑定 listener
+    // - 目的: 更新日志表述为地址准备
+    println!("step: prepare node2 addr");
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要保证 raft_addr 与 grpc_addr 同端口约束
+    // - 目的: 使用动态端口为新增节点分配 gRPC 地址
+    let node2_addr = allocate_local_addr().await;
+
     let add_req = AddHubRequest {
         node_id: 2,
-        raft_addr: "127.0.0.1:31002".to_string(),
-        grpc_addr: "127.0.0.1:32002".to_string(),
+        raft_addr: format!("http://{}", node2_addr),
+        grpc_addr: format!("http://{}", node2_addr),
         auto_promote: true,
         request_id: "rid-auto-transfer-add".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
     };
-    let _ = service.add_hub(Request::new(add_req)).await.unwrap();
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认 add_hub 执行阶段与潜在阻塞点
+    // - 目的: 输出阶段日志并通过超时避免测试挂起
+    println!("step: add_hub");
+    let _ = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        service.add_hub(Request::new(add_req)),
+    )
+    .await
+    .expect("add_hub timeout")
+    .unwrap();
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: add_hub 已负责启动新节点 gRPC 服务
+    // - 目的: 避免测试重复绑定端口导致冲突
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: membership 需要包含同端口地址映射
+    // - 目的: 保证 leader/follower 在 gRPC 通道中互通
+    let mut node_map = BTreeMap::new();
+    node_map.insert(1, BasicNode::new(format!("http://{}", leader_addr)));
+    node_map.insert(2, BasicNode::new(format!("http://{}", node2_addr)));
+    // ### 修改记录 (2026-03-15)
+    // - 原因: membership 变更可能因网络问题阻塞
+    // - 目的: 使用超时确保测试可快速暴露问题
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认 membership 变更阶段
+    // - 目的: 输出阶段日志辅助定位卡点
+    println!("step: change_membership");
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        leader
+            .raft
+            .change_membership(ChangeMembers::SetNodes(node_map), true),
+    )
+    .await
+    .expect("change_membership timeout")
+    .unwrap();
 
     let node1_signal = Arc::new(MockDrainSignal::new(0));
     manager
@@ -581,7 +822,20 @@ async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
         force: false,
         drain_timeout_ms: 1000,
     };
-    let _ = service.remove_hub(Request::new(mark_req)).await.unwrap();
+    // ### 修改记录 (2026-03-15)
+    // - 原因: remove_hub 标记阶段可能因状态异常阻塞
+    // - 目的: 增加超时以避免测试挂起
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认 remove_hub 标记阶段
+    // - 目的: 输出阶段日志辅助定位卡点
+    println!("step: remove_hub mark");
+    let _ = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        service.remove_hub(Request::new(mark_req)),
+    )
+    .await
+    .expect("remove_hub mark timeout")
+    .unwrap();
 
     let commit_req = RemoveHubRequest {
         node_id: 1,
@@ -590,11 +844,21 @@ async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
         force: false,
         drain_timeout_ms: 5000,
     };
-    let resp = service
-        .remove_hub(Request::new(commit_req))
-        .await
-        .unwrap()
-        .into_inner();
+    // ### 修改记录 (2026-03-15)
+    // - 原因: remove_hub 提交阶段包含 leader transfer 流程
+    // - 目的: 防止 transfer 阶段异常时测试无限等待
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认 remove_hub 提交阶段
+    // - 目的: 输出阶段日志辅助定位卡点
+    println!("step: remove_hub commit");
+    let resp = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        service.remove_hub(Request::new(commit_req)),
+    )
+    .await
+    .expect("remove_hub commit timeout")
+    .unwrap()
+    .into_inner();
     let final_resp = if resp.reason_code == "LEADER_TRANSFER_TIMEOUT" {
         let retry_commit = RemoveHubRequest {
             node_id: 1,
@@ -603,22 +867,29 @@ async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
             force: false,
             drain_timeout_ms: 5000,
         };
-        service
-            .remove_hub(Request::new(retry_commit))
-            .await
-            .unwrap()
-            .into_inner()
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 需要确认重试提交阶段
+        // - 目的: 输出阶段日志辅助定位卡点
+        println!("step: remove_hub commit retry");
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            service.remove_hub(Request::new(retry_commit)),
+        )
+        .await
+        .expect("remove_hub commit retry timeout")
+        .unwrap()
+        .into_inner()
     } else {
         resp
     };
     assert_eq!(final_resp.reason_code, "");
     assert_eq!(final_resp.status, "REMOVED");
     assert_eq!(manager.node_count().await, 1);
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要确认测试完成点
+    // - 目的: 输出完成日志避免误判卡死
+    println!("step: test done");
 }
-
-// ### ???? (2026-03-15)
-// - ??: ? stash ?? remove_hub ????
-// - ??: ?? inflight ????? DRAIN_TIMEOUT
 #[tokio::test]
 async fn remove_hub_commit_times_out_when_inflight_not_drained() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -652,10 +923,14 @@ async fn remove_hub_commit_times_out_when_inflight_not_drained() {
     ));
     let service = ClusterAdminService::new(manager.clone());
 
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let node_addr = allocate_local_addr().await;
     let add_req = AddHubRequest {
         node_id: 2,
-        raft_addr: "127.0.0.1:31002".to_string(),
-        grpc_addr: "127.0.0.1:32002".to_string(),
+        raft_addr: node_addr.clone(),
+        grpc_addr: node_addr,
         auto_promote: true,
         request_id: "rid-drain-timeout-add".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
@@ -754,10 +1029,14 @@ async fn remove_hub_commit_allows_same_request_id_retry_after_drain() {
     // ### 修改记录 (2026-03-15)
     // - 原因: 需要一个可移除节点作为目标
     // - 目的: 触发 remove_hub 的 COMMIT 分支
+    // ### 修改记录 (2026-03-15)
+    // - 原因: gRPC 与 Raft 端口必须一致
+    // - 目的: 使用动态端口避免冲突并保持同端口约束
+    let node_addr = allocate_local_addr().await;
     let add_req = AddHubRequest {
         node_id: 2,
-        raft_addr: "127.0.0.1:31002".to_string(),
-        grpc_addr: "127.0.0.1:32002".to_string(),
+        raft_addr: node_addr.clone(),
+        grpc_addr: node_addr,
         auto_promote: true,
         request_id: "rid-drain-retry-add".to_string(),
         compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
