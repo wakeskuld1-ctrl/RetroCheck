@@ -119,3 +119,47 @@ async fn edge_tcp_draining_rejects_connect_then_allows_after_resume() -> Result<
     handle.abort();
     Ok(())
 }
+
+// ### 修改记录 (2026-03-15)
+// - 原因: 需要覆盖 inflight_requests 的并发连接统计
+// - 目的: 确保连接生命周期与 inflight 计数一致
+// - 备注: 通过保持连接存活来避免提前 drop
+#[tokio::test]
+async fn edge_tcp_inflight_requests_tracks_concurrent_connections() -> Result<()> {
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 测试需要读取 inflight_requests 值
+    // - 目的: 获取网关句柄并控制生命周期
+    let (addr, gateway, handle) = spawn_gateway_with_handle().await?;
+    let mut streams = Vec::new();
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 并发连接需要先建立稳定的 TCP 会话
+    // - 目的: 形成 inflight 计数的可观测窗口
+    for _ in 0..8 {
+        streams.push(connect_with_retry(&addr).await?);
+    }
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: accept 与计数存在异步时序
+    // - 目的: 留出 inflight 累加时间以降低抖动
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        gateway.inflight_requests() >= 8,
+        "inflight should reflect concurrent connections"
+    );
+
+    drop(streams);
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 连接关闭后计数需要回落到 0
+    // - 目的: 验证 guard drop 能正常减计数
+    for _ in 0..10 {
+        if gateway.inflight_requests() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(gateway.inflight_requests(), 0);
+
+    handle.abort();
+    Ok(())
+}
