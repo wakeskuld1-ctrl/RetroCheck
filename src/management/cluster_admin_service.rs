@@ -662,7 +662,12 @@ async fn precheck_add(
         let (target_node, new_voters, membership_version_before, need_transfer_leader) = {
             let mut state = self.state.lock().await;
             if let Some(cached) = state.remove_request_cache.get(&req.request_id) {
-                return Ok(cached.clone());
+                // ### 修改记录 (2026-03-15)
+                // - 原因: COMMIT 错误缓存会阻断同 request_id 重试
+                // - 目的: 仅在已成功时短路返回，错误允许重新计算覆盖
+                if cached.reason_code.is_empty() && cached.status == "REMOVED" {
+                    return Ok(cached.clone());
+                }
             }
             if !state.nodes.contains_key(&req.node_id) {
                 let resp = remove_hub_response(
@@ -808,13 +813,10 @@ async fn precheck_add(
     }
 
     pub async fn add_edge(&self, req: AddEdgeRequest) -> AddEdgeResponse {
-        let leader_hint = match self.current_leader_id().await {
-            Ok(Some(leader_id)) if leader_id != self.local_node_id => {
-                Some(self.resolve_leader_hint(leader_id).await)
-            }
-            _ => None,
-        };
-        if let Some(leader_hint) = leader_hint {
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 无 leader 时 add_edge 不应落到本地执行
+        // - 目的: 统一 NOT_LEADER 语义并复用 leader_hint
+        if let Ok(Some(leader_hint)) = self.ensure_leader_or_redirect().await {
             if let Some(resp) = self
                 .forward_add_edge_to_target(&leader_hint, req.clone())
                 .await

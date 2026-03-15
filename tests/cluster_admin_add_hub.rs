@@ -686,6 +686,110 @@ async fn remove_hub_commit_times_out_when_inflight_not_drained() {
     assert_eq!(manager.node_count().await, 1);
 }
 
+// ### 修改记录 (2026-03-15)
+// - 原因: COMMIT 阶段错误缓存会阻断同 request_id 重试
+// - 目的: 验证同 request_id 在条件满足后允许成功覆盖
+#[tokio::test]
+async fn remove_hub_commit_allows_same_request_id_retry_after_drain() {
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 构造未选主但可提交的测试集群
+    // - 目的: 覆盖 COMMIT 重试缓存覆盖逻辑
+    let topology = Arc::new(MemoryTopologyService::default());
+    let router = RaftRouter::new();
+    let base_dir = std::env::temp_dir().join(
+        format!(
+            "cluster_admin_remove_drain_retry_{}",
+            Uuid::new_v4()
+        ),
+    );
+    let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
+    router.register(1, Arc::new(leader.clone()));
+    let mut members = std::collections::BTreeSet::new();
+    members.insert(1);
+    leader.raft.initialize(members).await.unwrap();
+    for _ in 0..50 {
+        if leader.raft.metrics().borrow().state == openraft::ServerState::Leader {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    let manager = Arc::new(ClusterNodeManager::new_with_topology(
+        1,
+        "http://127.0.0.1:50051".to_string(),
+        Arc::new(leader),
+        router.clone(),
+        ClusterBaseline {
+            app_semver: env!("CARGO_PKG_VERSION").to_string(),
+            sqlite_schema_version: 1,
+            sled_format_version: 1,
+            log_codec_version: 1,
+        },
+        topology,
+    ));
+    let service = ClusterAdminService::new(manager.clone());
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要一个可移除节点作为目标
+    // - 目的: 触发 remove_hub 的 COMMIT 分支
+    let add_req = AddHubRequest {
+        node_id: 2,
+        raft_addr: "127.0.0.1:31002".to_string(),
+        grpc_addr: "127.0.0.1:32002".to_string(),
+        auto_promote: true,
+        request_id: "rid-drain-retry-add".to_string(),
+        compatibility: Some(default_compatibility(env!("CARGO_PKG_VERSION").to_string())),
+    };
+    let _ = service.add_hub(Request::new(add_req)).await.unwrap();
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 先让 inflight 非零制造 DRAIN_TIMEOUT
+    // - 目的: 验证错误缓存可被后续成功覆盖
+    let node2_signal = Arc::new(MockDrainSignal::new(3));
+    manager
+        .register_drain_signal(2, node2_signal.clone() as Arc<dyn DrainSignal>)
+        .await;
+
+    let mark_req = RemoveHubRequest {
+        node_id: 2,
+        request_id: "rid-drain-retry-mark".to_string(),
+        phase: "MARK_DRAINING".to_string(),
+        force: false,
+        drain_timeout_ms: 1000,
+    };
+    let _ = service.remove_hub(Request::new(mark_req)).await.unwrap();
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 第一次 COMMIT 使用同 request_id 触发超时
+    // - 目的: 保留错误缓存以验证覆盖逻辑
+    let commit_req = RemoveHubRequest {
+        node_id: 2,
+        request_id: "rid-drain-retry-commit".to_string(),
+        phase: "COMMIT".to_string(),
+        force: false,
+        drain_timeout_ms: 20,
+    };
+    let first_resp = service
+        .remove_hub(Request::new(commit_req.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_resp.reason_code, "DRAIN_TIMEOUT");
+    assert_eq!(manager.node_count().await, 2);
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: inflight 清零后再次 COMMIT
+    // - 目的: 验证同 request_id 的错误缓存可被成功覆盖
+    node2_signal.set_inflight(0);
+    let second_resp = service
+        .remove_hub(Request::new(commit_req))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_resp.reason_code, "");
+    assert_eq!(second_resp.status, "REMOVED");
+    assert_eq!(manager.node_count().await, 1);
+}
+
 // ### ????
 // - 2026-03-15: ??: ? stash ?? add_edge ??
 // - 2026-03-15: ??: ?? standalone/?????????
@@ -729,6 +833,61 @@ async fn addedge_standalone_does_not_pull_group_metadata() {
     assert_eq!(provider.pull_count(), 0);
     let events = manager.audit_events_snapshot().await;
     assert!(!events.iter().any(|event| event.action == "cluster.add_edge.group_metadata_pull"));
+}
+
+// ### 修改记录 (2026-03-15)
+// - 原因: 无 leader 时 add_edge 当前会落到本地执行
+// - 目的: 统一 NOT_LEADER 语义，避免 follower 写入
+#[tokio::test]
+async fn addedge_returns_not_leader_when_leader_not_elected() {
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 构造未选主集群场景
+    // - 目的: 覆盖 add_edge 在无 leader 时的返回语义
+    let topology = Arc::new(MemoryTopologyService::default());
+    let router = RaftRouter::new();
+    let base_dir = std::env::temp_dir().join(
+        format!(
+            "cluster_admin_addedge_no_leader_{}",
+            Uuid::new_v4()
+        ),
+    );
+    let node = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
+    router.register(1, Arc::new(node.clone()));
+    let provider = Arc::new(MockEdgeMetadataProvider::success());
+    let manager = ClusterNodeManager::new_with_services_and_edge_metadata(
+        2,
+        "http://127.0.0.1:50052".to_string(),
+        Arc::new(node),
+        router,
+        Arc::new(
+            check_program::management::cluster_admin_domain::StrictCompatibilityChecker::new(
+                ClusterBaseline {
+                    app_semver: env!("CARGO_PKG_VERSION").to_string(),
+                    sqlite_schema_version: 1,
+                    sled_format_version: 1,
+                    log_codec_version: 1,
+                },
+            ),
+        ),
+        topology,
+        provider,
+    );
+    let service = ClusterAdminService::new(Arc::new(manager));
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 无 leader 时需要返回 NOT_LEADER
+    // - 目的: 避免 follower 本地注册
+    let resp = service
+        .add_edge(Request::new(AddEdgeRequest {
+            edge_id: "edge-no-leader-1".to_string(),
+            group_id: "".to_string(),
+            request_id: "rid-addedge-no-leader-1".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.reason_code, "NOT_LEADER");
+    assert!(!resp.suggested_action.is_empty());
 }
 
 #[tokio::test]
