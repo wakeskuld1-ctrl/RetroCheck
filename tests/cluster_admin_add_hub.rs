@@ -300,16 +300,22 @@ async fn add_hub_on_follower_fallback_then_resolve_real_leader_hint() {
     assert_eq!(second_resp.leader_hint, "http://127.0.0.1:50051");
 }
 
-// ### ????
-// - 2026-03-14: ??: ??????????????
-// - 2026-03-14: ??: ?? add_hub ?? leader ??? NOT_LEADER + leader_hint
-// - 2026-03-15: ??: ?? stash ? remove_hub/add_edge ??
-// - 2026-03-15: ??: ????????????/????
+// ### 修改记录
+// - 2026-03-14: 原因: 需要覆盖无 leader 时的 add_hub 重定向
+// - 2026-03-14: 目的: 断言返回 NOT_LEADER + leader_hint
+// - 2026-03-15: 原因: stash 流程引入 remove_hub/add_edge 覆盖
+// - 2026-03-15: 目的: 补充重定向/审计事件的回归保护
+// ### 修改记录 (2026-03-15)
+// - 原因: 注释存在 ANSI 乱码
+// - 目的: 还原测试意图说明，避免误读
 #[tokio::test]
 async fn add_hub_redirects_when_leader_not_elected() {
-    // ### ???? (2026-03-14)
-    // - ??: ??????????????
-    // - ??: ???????
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 需要构造无 leader 的拓扑场景
+    // - 目的: 覆盖重定向输出
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 注释存在 ANSI 乱码
+    // - 目的: 还原测试意图说明，避免误读
     let topology = Arc::new(MemoryTopologyService::default());
     let router = RaftRouter::new();
     let base_dir =
@@ -317,9 +323,12 @@ async fn add_hub_redirects_when_leader_not_elected() {
     let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
     router.register(1, Arc::new(leader.clone()));
 
-    // ### ???? (2026-03-14)
-    // - ??: local_node_id ? leader_node ????? follower ??
-    // - ??: ??? leader ????????
+    // ### 修改记录 (2026-03-14)
+    // - 原因: local_node_id 设为非 leader 节点
+    // - 目的: 覆盖 follower 触发重定向的路径
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 注释存在 ANSI 乱码
+    // - 目的: 还原测试意图说明，避免误读
     let manager = Arc::new(ClusterNodeManager::new_with_topology(
         2,
         "http://127.0.0.1:50052".to_string(),
@@ -335,9 +344,12 @@ async fn add_hub_redirects_when_leader_not_elected() {
     ));
     let service = ClusterAdminService::new(manager);
 
-    // ### ???? (2026-03-14)
-    // - ??: ???? add_hub ??
-    // - ??: ?? ensure_leader_or_redirect
+    // ### 修改记录 (2026-03-14)
+    // - 原因: 触发 add_hub 流程以覆盖重定向
+    // - 目的: 覆盖 ensure_leader_or_redirect 逻辑
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 注释存在 ANSI 乱码
+    // - 目的: 还原测试意图说明，避免误读
     let req = AddHubRequest {
         node_id: 7,
         raft_addr: "127.0.0.1:31007".to_string(),
@@ -352,9 +364,12 @@ async fn add_hub_redirects_when_leader_not_elected() {
     assert!(!resp.leader_hint.is_empty());
 }
 
-// ### ????
-// - 2026-03-15: ??: ? stash ?? remove_hub ??
-// - 2026-03-15: ??: ????????????????
+// ### 修改记录
+// - 2026-03-15: 原因: stash 流程的 remove_hub 需要分阶段
+// - 2026-03-15: 目的: 覆盖未 MARK 直接 COMMIT 的拒绝
+// ### 修改记录 (2026-03-15)
+// - 原因: 注释存在 ANSI 乱码
+// - 目的: 还原测试意图说明，避免误读
 #[tokio::test]
 async fn remove_hub_requires_mark_before_commit() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -440,9 +455,12 @@ async fn remove_hub_requires_mark_before_commit() {
     assert_eq!(manager.node_count().await, 1);
 }
 
-// ### ???? (2026-03-15)
-// - ??: ? stash ?? remove_hub ???????
-// - ??: ??????????? leader
+// ### 修改记录 (2026-03-15)
+// - 原因: stash 流程下 remove_hub 需处理移除 leader
+// - 目的: 覆盖移除当前 leader 的拒绝路径
+// ### 修改记录 (2026-03-15)
+// - 原因: 注释存在 ANSI 乱码
+// - 目的: 还原测试意图说明，避免误读
 #[tokio::test]
 async fn remove_hub_rejects_commit_when_target_is_current_leader() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -500,9 +518,12 @@ async fn remove_hub_rejects_commit_when_target_is_current_leader() {
     assert_eq!(manager.node_count().await, 1);
 }
 
-// ### ???? (2026-03-15)
-// - ??: ? stash ?? remove_hub ??????
-// - ??: ?? leader ???????
+// ### 修改记录 (2026-03-15)
+// - 原因: stash 流程下 remove_hub 需要触发 leader 转移
+// - 目的: 覆盖转移后提交成功路径
+// ### 修改记录 (2026-03-15)
+// - 原因: 注释存在 ANSI 乱码
+// - 目的: 还原测试意图说明，避免误读
 #[tokio::test]
 async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -593,9 +614,12 @@ async fn remove_hub_commit_auto_transfers_leader_and_succeeds() {
     assert_eq!(manager.node_count().await, 1);
 }
 
-// ### ???? (2026-03-15)
-// - ??: ? stash ?? remove_hub ????
-// - ??: ?? inflight ????? DRAIN_TIMEOUT
+// ### 修改记录 (2026-03-15)
+// - 原因: stash 流程下 remove_hub 需要检查 inflight
+// - 目的: 覆盖 inflight 未排空时的 DRAIN_TIMEOUT
+// ### 修改记录 (2026-03-15)
+// - 原因: 注释存在 ANSI 乱码
+// - 目的: 还原测试意图说明，避免误读
 #[tokio::test]
 async fn remove_hub_commit_times_out_when_inflight_not_drained() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -686,9 +710,12 @@ async fn remove_hub_commit_times_out_when_inflight_not_drained() {
     assert_eq!(manager.node_count().await, 1);
 }
 
-// ### ????
-// - 2026-03-15: ??: ? stash ?? add_edge ??
-// - 2026-03-15: ??: ?? standalone/?????????
+// ### 修改记录
+// - 2026-03-15: 原因: stash 流程下补齐 add_edge 行为
+// - 2026-03-15: 目的: 覆盖 standalone/带 group 的元数据拉取差异
+// ### 修改记录 (2026-03-15)
+// - 原因: 注释存在 ANSI 乱码
+// - 目的: 还原测试意图说明，避免误读
 #[tokio::test]
 async fn addedge_standalone_does_not_pull_group_metadata() {
     let topology = Arc::new(MemoryTopologyService::default());

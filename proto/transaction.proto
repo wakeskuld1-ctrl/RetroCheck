@@ -10,9 +10,11 @@ service DatabaseService {
   rpc CheckHealth (Empty) returns (Empty);
 }
 
-// ### ???? (2026-03-01)
-// - ??: ????????????????
-// - ??: ????????????????
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要提供顺序规则管理接口
+// - 目的: 支持规则更新与版本查询
+// - 2026-03-15: 原因: 注释存在 ANSI 乱码
+// - 2026-03-15: 目的: 还原说明，避免误读
 service OrderRulesAdmin {
   rpc UpdateRules (UpdateRulesRequest) returns (UpdateRulesResponse);
   rpc GetRulesVersion (GetRulesVersionRequest) returns (GetRulesVersionResponse);
@@ -20,9 +22,11 @@ service OrderRulesAdmin {
 
 service ClusterAdmin {
   rpc AddHub (AddHubRequest) returns (AddHubResponse);
-  // ### ????
-  // - 2026-03-15: ??: ?? add_edge/remove_hub ??
-  // - 2026-03-15: ??: ?????????????
+  // ### 修改记录
+  // - 2026-03-15: 原因: 补齐 add_edge/remove_hub 的协议入口
+  // - 2026-03-15: 目的: 统一 ClusterAdmin 管理能力
+  // - 2026-03-15: 原因: 注释存在 ANSI 乱码
+  // - 2026-03-15: 目的: 还原说明，避免误读
   rpc AddEdge (AddEdgeRequest) returns (AddEdgeResponse);
   rpc RemoveHub (RemoveHubRequest) returns (RemoveHubResponse);
 }
@@ -48,21 +52,29 @@ message GetVersionResponse { int32 version = 1; }
 
 message Empty {}
 
-// ### ???? (2026-03-01)
-// - ??: ?????? JSON
-// - ??: ????????????
+// ### 修改记录 (2026-03-01)
+// - 原因: 顺序规则以 JSON 方式下发
+// - 目的: 保持规则配置的序列化兼容
+// - 2026-03-15: 原因: 注释存在 ANSI 乱码
+// - 2026-03-15: 目的: 还原说明，避免误读
 message UpdateRulesRequest { string rules_json = 1; }
-// ### ???? (2026-03-01)
-// - ??: ????????
-// - ??: ????????????
+// ### 修改记录 (2026-03-01)
+// - 原因: 更新规则后需返回版本号
+// - 目的: 支持幂等与缓存对齐
+// - 2026-03-15: 原因: 注释存在 ANSI 乱码
+// - 2026-03-15: 目的: 还原说明，避免误读
 message UpdateRulesResponse { uint64 version = 1; }
-// ### ???? (2026-03-01)
-// - ??: ????????
-// - ??: ????????????
+// ### 修改记录 (2026-03-01)
+// - 原因: 需要查询当前规则版本
+// - 目的: 支持客户端按版本决定是否刷新
+// - 2026-03-15: 原因: 注释存在 ANSI 乱码
+// - 2026-03-15: 目的: 还原说明，避免误读
 message GetRulesVersionRequest {}
-// ### ???? (2026-03-01)
-// - ??: ??????????
-// - ??: ??????????
+// ### 修改记录 (2026-03-01)
+// - 原因: 返回规则版本号
+// - 目的: 供客户端缓存与对齐
+// - 2026-03-15: 原因: 注释存在 ANSI 乱码
+// - 2026-03-15: 目的: 还原说明，避免误读
 message GetRulesVersionResponse { uint64 version = 1; }
 
 message AddHubRequest {
@@ -81,9 +93,11 @@ message AddHubResponse {
   string suggested_action = 4;
 }
 
-// ### ????
-// - 2026-03-15: ??: ???? add_edge/remove_hub ???????
-// - 2026-03-15: ??: ?? RPC ??????????
+// ### 修改记录
+// - 2026-03-15: 原因: 补齐 add_edge/remove_hub 请求结构
+// - 2026-03-15: 目的: 为管理 RPC 提供统一参数
+// - 2026-03-15: 原因: 注释存在 ANSI 乱码
+// - 2026-03-15: 目的: 还原说明，避免误读
 message AddEdgeRequest {
   string edge_id = 1;
   string group_id = 2;

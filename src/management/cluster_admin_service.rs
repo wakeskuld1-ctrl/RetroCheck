@@ -337,20 +337,26 @@ impl ClusterNodeManager {
     }
 
     async fn ensure_leader_or_redirect(&self) -> Result<Option<String>> {
-        // ### ????
-        // - 2026-03-14: ??: ? leader ? wait_for_leader ?????
-        // - 2026-03-14: ??: ?? add_hub ?? NOT_LEADER + leader_hint
-        // - 2026-03-15: ??: ?? stash ???????
-        // - 2026-03-15: ??: ??????? cluster.redirect ??
+        // ### 修改记录
+        // - 2026-03-14: 原因: 无 leader 时 wait_for_leader 可能阻塞
+        // - 2026-03-14: 目的: add_hub 返回 NOT_LEADER + leader_hint
+        // - 2026-03-15: 原因: 通过 stash 补充审计记录
+        // - 2026-03-15: 目的: 增加 cluster.redirect 审计事件
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 注释存在 ANSI 乱码
+        // - 目的: 还原重定向语义说明，避免误读
         let leader_id = self.current_leader_id().await?;
         if let Some(leader_id) = leader_id {
             if leader_id == self.local_node_id {
                 return Ok(None);
             }
             let leader_hint = self.resolve_leader_hint(leader_id).await;
-            // ### ???? (2026-03-15)
-            // - ??: ???????? leader_hint
-            // - ??: ???????????
+            // ### 修改记录 (2026-03-15)
+            // - 原因: 重定向需要记录 leader_hint
+            // - 目的: 便于审计与排查重定向链路
+            // ### 修改记录 (2026-03-15)
+            // - 原因: 注释存在 ANSI 乱码
+            // - 目的: 还原重定向语义说明，避免误读
             self.append_audit_event(
                 "cluster.redirect",
                 "ok",
@@ -360,9 +366,12 @@ impl ClusterNodeManager {
             return Ok(Some(leader_hint));
         }
 
-        // ### ????
-        // - 2026-03-14: ??: ??????????????????
-        // - 2026-03-14: ??: ?? leader_node ???? hint
+        // ### 修改记录
+        // - 2026-03-14: 原因: 无 leader 时仍需给出可用重定向
+        // - 2026-03-14: 目的: 使用 leader_node 作为 hint 的兜底
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 注释存在 ANSI 乱码
+        // - 目的: 还原重定向语义说明，避免误读
         let fallback_id = self.leader_node.node_id();
         Ok(Some(self.resolve_leader_hint(fallback_id).await))
     }
