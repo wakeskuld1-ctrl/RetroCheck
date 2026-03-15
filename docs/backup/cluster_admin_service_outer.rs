@@ -1,3 +1,11 @@
+﻿// ### 归档标识
+// - 本文件仅用于历史对照，已移入 docs/backup，不参与编译/引用。
+// - 若需恢复使用，请先说明业务场景并评估替代方案。
+//
+// ### 修改记录 (2026-03-15)
+// - 原因：清理未引用的历史拷贝文件，避免误用。
+// - 目的：保留历史对照，降低维护成本与误用风险。
+
 use crate::pb::cluster_admin_server::ClusterAdmin;
 compile_error!("I AM HERE");
 use crate::pb::{AddHubRequest, AddHubResponse, NodeCompatibility, RemoveHubRequest, RemoveHubResponse};
@@ -1067,3 +1075,4 @@ impl ClusterAdmin for ClusterAdminService {
 pub fn default_compatibility(app_semver: String) -> NodeCompatibility {
     domain_default_compatibility(app_semver)
 }
+

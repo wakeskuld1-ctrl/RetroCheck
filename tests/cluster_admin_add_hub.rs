@@ -84,6 +84,28 @@ impl EdgeMetadataProvider for MockEdgeMetadataProvider {
     }
 }
 
+// ### 修改记录 (2026-03-15)
+// - 原因: add_edge 相关测试需要 leader 已选举，否则会返回 NOT_LEADER
+// - 目的: 统一等待 leader 选举，保持 ready/metadata 断言稳定
+async fn wait_for_leader(leader: &RaftNode) {
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要显式初始化 Raft 成员集合触发选举
+    // - 目的: 避免测试中 leader 为空导致的非预期返回
+    let mut members = std::collections::BTreeSet::new();
+    members.insert(1);
+    leader.raft.initialize(members).await.unwrap();
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 选举是异步过程，需要轮询等待
+    // - 目的: 确保后续 add_edge 行为在 leader 就绪后执行
+    for _ in 0..50 {
+        if leader.raft.metrics().borrow().state == openraft::ServerState::Leader {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn add_hub_idempotent_with_same_request_id() {
     let topology = Arc::new(MemoryTopologyService::default());
@@ -800,6 +822,10 @@ async fn addedge_standalone_does_not_pull_group_metadata() {
     let base_dir = std::env::temp_dir().join(format!("cluster_admin_addedge_a_{}", Uuid::new_v4()));
     let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
     router.register(1, Arc::new(leader.clone()));
+    // ### 修改记录 (2026-03-15)
+    // - 原因: add_edge 在无 leader 时会返回 NOT_LEADER
+    // - 目的: 保持 ready/metadata 断言覆盖 leader 场景
+    wait_for_leader(&leader).await;
     let provider = Arc::new(MockEdgeMetadataProvider::success());
     let manager = ClusterNodeManager::new_with_services_and_edge_metadata(
         1,
@@ -897,6 +923,10 @@ async fn addedge_with_group_id_pulls_group_metadata_before_ready() {
     let base_dir = std::env::temp_dir().join(format!("cluster_admin_addedge_b_{}", Uuid::new_v4()));
     let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
     router.register(1, Arc::new(leader.clone()));
+    // ### 修改记录 (2026-03-15)
+    // - 原因: group_id 分支依赖 leader 状态，未选举会返回 NOT_LEADER
+    // - 目的: 确保 metadata pull + ready 顺序断言稳定
+    wait_for_leader(&leader).await;
     let provider = Arc::new(MockEdgeMetadataProvider::success());
     let manager = ClusterNodeManager::new_with_services_and_edge_metadata(
         1,
@@ -951,6 +981,10 @@ async fn addedge_with_group_id_returns_target_metadata_missing_when_group_metada
         std::env::temp_dir().join(format!("cluster_admin_addedge_b_missing_{}", Uuid::new_v4()));
     let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
     router.register(1, Arc::new(leader.clone()));
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 缺失 metadata 的分支仍需 leader 才会走到业务错误
+    // - 目的: 避免 NOT_LEADER 抢占目标错误码
+    wait_for_leader(&leader).await;
     let provider = Arc::new(MockEdgeMetadataProvider::with_fail_kind(
         "TARGET_METADATA_MISSING",
     ));
@@ -994,6 +1028,10 @@ async fn addedge_with_group_id_returns_target_not_found_when_group_absent() {
         std::env::temp_dir().join(format!("cluster_admin_addedge_b_notfound_{}", Uuid::new_v4()));
     let leader = RaftNode::start(1, base_dir, router.clone()).await.unwrap();
     router.register(1, Arc::new(leader.clone()));
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 未选举时会直接返回 NOT_LEADER，掩盖 NOT_FOUND 断言
+    // - 目的: 保持目标不存在时的错误码覆盖
+    wait_for_leader(&leader).await;
     let provider = Arc::new(MockEdgeMetadataProvider::with_fail_kind("TARGET_NOT_FOUND"));
     let manager = ClusterNodeManager::new_with_services_and_edge_metadata(
         1,
