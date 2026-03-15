@@ -10,6 +10,15 @@ service DatabaseService {
   rpc CheckHealth (Empty) returns (Empty);
 }
 
+// ### 修改记录 (2026-03-15)
+// - 原因: 需要将 Raft 节点间通信迁移到 gRPC
+// - 目的: 为 AppendEntries/Vote/InstallSnapshot 提供统一 RPC 入口
+service RaftService {
+  rpc AppendEntries (RaftPayload) returns (RaftPayload);
+  rpc InstallSnapshot (RaftPayload) returns (RaftPayload);
+  rpc Vote (RaftPayload) returns (RaftPayload);
+}
+
 // ### ???? (2026-03-01)
 // - ??: ????????????????
 // - ??: ????????????????
@@ -47,6 +56,11 @@ message GetVersionRequest { string table = 1; }
 message GetVersionResponse { int32 version = 1; }
 
 message Empty {}
+
+// ### 修改记录 (2026-03-15)
+// - 原因: Raft RPC 需要在 gRPC 中传递复杂结构
+// - 目的: 用 bytes 载荷承载 bincode 序列化数据
+message RaftPayload { bytes payload = 1; }
 
 // ### ???? (2026-03-01)
 // - ??: ?????? JSON
