@@ -506,7 +506,10 @@ async fn precheck_add(
 
         let node_base_dir =
             std::env::temp_dir().join(format!("hub_dynamic_node_{}_{}", req.node_id, Uuid::new_v4()));
-        let node = RaftNode::start(req.node_id, node_base_dir, self.raft_router.clone())
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 动态新增节点需要使用 gRPC 网络
+        // - 目的: 让新节点参与真实网络通信
+        let node = RaftNode::start_grpc(req.node_id, node_base_dir)
             .await
             .map_err(|e| {
                 AddHubError::invalid_argument(
