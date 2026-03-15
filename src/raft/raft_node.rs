@@ -2,6 +2,10 @@
 //! - 原因: 需要提供 RaftNode 最小封装
 //! - 目的: 为 Raft 核心落地提供可测试入口
 
+// ### 修改记录 (2026-03-15)
+// - 原因: 需要引入 gRPC 网络工厂
+// - 目的: 支持 start_grpc 使用生产网络
+use crate::raft::grpc_network::RaftGrpcNetworkFactory;
 use crate::raft::network::{RaftNetworkFactoryImpl, RaftNetworkTarget, RaftRouter};
 use crate::raft::state_machine::SqliteStateMachine;
 use crate::raft::store::RaftStore;
@@ -16,7 +20,10 @@ use openraft::raft::{
 // ### 修改记录 (2026-02-27)
 // - 原因: 需要读取节点状态
 // - 目的: 选举与领导者判断
-use openraft::{Config, Raft, ServerState};
+// ### 修改记录 (2026-03-15)
+// - 原因: 需要为 start_with_network 约束网络工厂类型
+// - 目的: 复用 OpenRaft 的 RaftNetworkFactory trait
+use openraft::{Config, Raft, RaftNetworkFactory, ServerState};
 use std::path::PathBuf;
 use std::sync::Arc;
 // ### 修改记录 (2026-02-27)
@@ -135,6 +142,65 @@ impl RaftNode {
             raft,
             state_machine,
         })
+    }
+
+    /// ### 修改记录 (2026-03-15)
+    /// - 原因: 需要提供可插拔网络的启动入口
+    /// - 目的: 统一 gRPC 与内存网络的初始化流程
+    pub async fn start_with_network<N>(
+        node_id: NodeId,
+        base_dir: PathBuf,
+        network: N,
+    ) -> Result<Self>
+    where
+        N: RaftNetworkFactory<TypeConfig> + Send + Sync + 'static,
+    {
+        // 1. 准备目录
+        if !base_dir.exists() {
+            std::fs::create_dir_all(&base_dir)?;
+        }
+        let raft_db_path = base_dir.join("raft_db");
+        let sqlite_path = base_dir.join("node.db");
+
+        // 2. 初始化存储 (Sled)
+        let store = RaftStore::open(&raft_db_path)?;
+
+        // 3. 初始化状态机 (SQLite)
+        let state_machine = SqliteStateMachine::new(sqlite_path.to_string_lossy().to_string())?;
+
+        // 4. 初始化配置
+        let config = Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 200,
+            election_timeout_max: 300,
+            ..Default::default()
+        };
+        let config = build_validated_raft_config(config)?;
+
+        // 5. 启动 Raft
+        let raft = Raft::new(
+            node_id,
+            config,
+            network,
+            store.clone(),
+            state_machine.clone(),
+        )
+        .await?;
+
+        Ok(Self {
+            node_id,
+            base_dir,
+            raft,
+            state_machine,
+        })
+    }
+
+    /// ### 修改记录 (2026-03-15)
+    /// - 原因: 需要提供 gRPC 生产启动入口
+    /// - 目的: 使用 RaftGrpcNetworkFactory 启动节点
+    pub async fn start_grpc(node_id: NodeId, base_dir: PathBuf) -> Result<Self> {
+        let network = RaftGrpcNetworkFactory::new();
+        Self::start_with_network(node_id, base_dir, network).await
     }
 
     pub async fn start_local(node_id: NodeId, base_dir: PathBuf) -> Result<Self> {
