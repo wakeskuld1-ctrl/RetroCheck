@@ -7,6 +7,10 @@ use check_program::management::cluster_admin_service::{
 use check_program::pb::cluster_admin_client::ClusterAdminClient;
 use check_program::management::order_rules_service::{OrderRulesAdminService, OrderRulesStore};
 use check_program::pb::cluster_admin_server::ClusterAdminServer;
+/// ### 修改记录 (2026-03-15)
+/// - 原因: 需要注册 Raft gRPC 服务端
+/// - 目的: 将 RaftService 加入同端口服务列表
+use check_program::pb::raft_service_server::RaftServiceServer;
 use check_program::pb::database_service_server::{DatabaseService, DatabaseServiceServer};
 use check_program::pb::order_rules_admin_server::OrderRulesAdminServer;
 use check_program::pb::{
@@ -14,6 +18,10 @@ use check_program::pb::{
     ExecuteResponse, GetVersionRequest, GetVersionResponse, NodeCompatibility, PrepareRequest,
     PrepareResponse, RemoveHubRequest, RollbackRequest, RollbackResponse,
 };
+/// ### 修改记录 (2026-03-15)
+/// - 原因: 需要引入 Raft gRPC 服务实现
+/// - 目的: 让 server 能构造 RaftServiceImpl
+use check_program::raft::grpc_service::RaftServiceImpl;
 use check_program::raft::router::Router;
 use check_program::raft::{network::RaftRouter, raft_node::RaftNode};
 use clap::Parser;
@@ -38,11 +46,15 @@ impl DrainSignal for EdgeGatewayDrainSignal {
     }
 }
 
+/// ### 修改记录 (2026-03-15)
+/// - 原因: 需要携带 Raft gRPC 服务实例
+/// - 目的: 统一在启动流程中注入到 tonic Server
 type BootstrapComponents = (
     Arc<dyn StorageEngine>,
     Option<Arc<Router>>,
     Option<ClusterAdminService>,
     Option<Arc<ClusterNodeManager>>,
+    Option<RaftServiceImpl>,
 );
 
 /// Database Server CLI Arguments
@@ -372,7 +384,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ### 修改记录 (2026-02-17)
     // - 原因: 需要将写路径切换到 Router
     // - 目的: 保持协议不变的同时完成内部替换
-    let (engine, router, cluster_admin_service, cluster_manager): BootstrapComponents =
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要把 Raft gRPC 服务实例带出初始化流程
+    // - 目的: 与其他服务一起注册到 tonic Server
+    let (engine, router, cluster_admin_service, cluster_manager, raft_service): BootstrapComponents =
         match args.engine.as_str() {
         "sqlite" => {
             let raft_router = RaftRouter::new();
@@ -386,6 +401,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sled_format_version: 1,
                 log_codec_version: 1,
             };
+            // ### 修改记录 (2026-03-15)
+            // - 原因: 需要构造 Raft gRPC 服务端实现
+            // - 目的: 后续注册到同一 gRPC 端口
+            let raft_service = RaftServiceImpl::new(raft_node.clone());
             let cluster_manager = Arc::new(ClusterNodeManager::new(
                 1,
                 local_grpc_addr.clone(),
@@ -400,6 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(router),
                 Some(cluster_admin),
                 Some(cluster_manager),
+                Some(raft_service),
             )
         }
         _ => return Err(format!("Unknown engine: {}", args.engine).into()),
@@ -454,6 +474,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(cluster_admin_service) = cluster_admin_service {
         builder = builder.add_service(ClusterAdminServer::new(cluster_admin_service));
+    }
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 需要让 RaftService 与现有 gRPC 服务共用端口
+    // - 目的: 复用已有 Server 监听并提供 Raft RPC
+    if let Some(raft_service) = raft_service {
+        builder = builder.add_service(RaftServiceServer::new(raft_service));
     }
 
     builder.serve(addr).await?;

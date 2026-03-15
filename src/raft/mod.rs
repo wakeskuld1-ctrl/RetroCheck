@@ -10,6 +10,10 @@ pub mod network;
 /// - 原因: Raft gRPC 需要序列化工具
 /// - 目的: 暴露统一编解码模块
 pub mod grpc_codec;
+/// ### 修改记录 (2026-03-15)
+/// - 原因: 需要暴露 Raft gRPC 服务端
+/// - 目的: 供 server 注册 RaftService
+pub mod grpc_service;
 /// ### 修改记录 (2026-02-17)
 /// - 原因: 需要暴露 RaftNode 封装
 /// - 目的: 提供 Raft 核心启动入口
