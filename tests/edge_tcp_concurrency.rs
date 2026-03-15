@@ -8,7 +8,7 @@ use serde_json::Value;
 mod edge_tcp_common;
 use edge_tcp_common::{
     build_auth_hello, build_session_request, connect_with_retry, header_prefix_for_response,
-    read_frame, send_frame, spawn_gateway,
+    read_frame, send_frame, spawn_gateway, spawn_gateway_with_handle,
 };
 
 #[tokio::test]
@@ -63,5 +63,19 @@ async fn edge_tcp_allows_parallel_sessions() -> Result<()> {
     }
 
     handle.abort();
+    Ok(())
+}
+
+// ### 修改记录 (2026-03-15)
+// - 原因: 需要先用 TDD 引入排空回归测试的占位调用
+// - 目的: 让后续新增的 spawn_gateway_with_handle 在编译期被强约束
+// - 备注: 该测试会先失败，作为实现前的 RED 阶段
+#[tokio::test]
+async fn edge_tcp_draining_rejects_connect_then_allows_after_resume() -> Result<()> {
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 排空测试需要能直接控制网关 draining 状态
+    // - 目的: 暴露网关句柄以便后续测试逻辑挂接
+    // - 备注: 当前仅占位，等待 helper 实现
+    let (_addr, _gateway, _handle) = spawn_gateway_with_handle().await?;
     Ok(())
 }

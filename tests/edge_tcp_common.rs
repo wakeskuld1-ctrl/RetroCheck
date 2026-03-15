@@ -61,6 +61,34 @@ pub async fn spawn_gateway() -> Result<(String, tokio::task::JoinHandle<Result<(
     Ok((addr, handle))
 }
 
+// ### 修改记录 (2026-03-15)
+// - 原因: 排空回归测试需要直接控制网关 draining 状态
+// - 目的: 返回 Arc<EdgeGateway> 供测试调用 set_draining/inflight_requests
+// - 备注: 保持与 spawn_gateway 相同启动路径，避免行为偏差
+pub async fn spawn_gateway_with_handle(
+) -> Result<(String, Arc<EdgeGateway>, tokio::task::JoinHandle<Result<()>>)> {
+    let port = reserve_port().await?;
+    let addr = format!("127.0.0.1:{}", port);
+    let router = Arc::new(Router::new_for_test(true));
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 复用现有测试启动前置条件
+    // - 目的: 保证 data 表存在，避免 UploadData 失败
+    ensure_data_table(&router).await?;
+    let config = EdgeGatewayConfig::default();
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 测试路径需要与正常网关一致的规则存储
+    // - 目的: 避免顺序规则模块缺失导致的非预期失败
+    let order_rules_store = Arc::new(OrderRulesStore::new());
+    let gateway = Arc::new(EdgeGateway::new(
+        addr.clone(),
+        router,
+        config,
+        order_rules_store,
+    )?);
+    let handle = tokio::spawn(gateway.clone().run());
+    Ok((addr, gateway, handle))
+}
+
 pub async fn spawn_gateway_with_config(
     config_path: &std::path::Path,
 ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
