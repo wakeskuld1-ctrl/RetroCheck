@@ -21,7 +21,7 @@ use crate::management::order_rules_service::OrderRulesStore;
 use crate::raft::router::Router;
 use flatbuffers::FlatBufferBuilder;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
 use uuid::Uuid;
 
 pub type SessionId = u64;
@@ -1848,6 +1848,10 @@ pub struct EdgeGateway {
     // - 2026-03-15: ??: ????????????
     // - 2026-03-15: ??: ? remove_hub ???????????
     draining: Arc<AtomicBool>,
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 排空状态需要打断 accept 阻塞
+    // - 目的: 让 run 循环及时关闭监听并在恢复时重建
+    drain_notify: Arc<Notify>,
     // ### ????
     // - 2026-03-15: ??: ????????????
     // - 2026-03-15: ??: ???????????
@@ -1999,6 +2003,10 @@ impl EdgeGateway {
             // - 2026-03-15: ??: ???????????
             // - 2026-03-15: ??: ??? draining ??
             draining: Arc::new(AtomicBool::new(false)),
+            // ### 修改记录 (2026-03-15)
+            // - 原因: 排空切换需要唤醒 accept 等待
+            // - 目的: 支持关闭监听并安全重绑
+            drain_notify: Arc::new(Notify::new()),
             // ### ????
             // - 2026-03-15: ??: ?????????????
             // - 2026-03-15: ??: ??? inflight ??
@@ -2025,7 +2033,11 @@ impl EdgeGateway {
     // - 2026-03-15: ??: DrainSignal ?????????
     // - 2026-03-15: ??: ? remove_hub ??????
     pub fn set_draining(&self, reject_new: bool) {
+        // ### 修改记录 (2026-03-15)
+        // - 原因: draining 变更需要打断 accept 阻塞
+        // - 目的: 触发 run 循环关闭/重建监听
         self.draining.store(reject_new, Ordering::SeqCst);
+        self.drain_notify.notify_waiters();
     }
 
     // ### ????
@@ -2043,9 +2055,14 @@ impl EdgeGateway {
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let listener = TcpListener::bind(&self.addr)
-            .await
-            .context("Failed to bind Edge TCP port")?;
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 排空期间需要停止监听以保证 connect 失败
+        // - 目的: 通过可关闭/重绑的 listener 控制排空行为
+        let mut listener = Some(
+            TcpListener::bind(&self.addr)
+                .await
+                .context("Failed to bind Edge TCP port")?,
+        );
         println!("EdgeGateway listening on {}", self.addr);
 
         // ### 修改记录 (2026-03-01)
@@ -2197,14 +2214,61 @@ impl EdgeGateway {
         }
 
         loop {
-            let (socket, _) = listener.accept().await?;
-
-            // ### ????
-            // - 2026-03-15: ??: ???????????
-            // - 2026-03-15: ??: ?? inflight ????
+            // ### 修改记录 (2026-03-15)
+            // - 原因: draining=true 时不能继续监听
+            // - 目的: 关闭 listener 以保证 connect 直接失败
             if self.draining.load(Ordering::SeqCst) {
+                listener.take();
+                // ### 修改记录 (2026-03-15)
+                // - 原因: Notify 可能错过，需要定期检查状态
+                // - 目的: 防止 draining 结束后主循环卡死
+                while self.draining.load(Ordering::SeqCst) {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        self.drain_notify.notified(),
+                    )
+                    .await;
+                }
                 continue;
             }
+
+            if listener.is_none() {
+                // ### 修改记录 (2026-03-15)
+                // - 原因: 排空结束后必须恢复监听
+                // - 目的: 允许客户端重新 connect
+                loop {
+                    if self.draining.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match TcpListener::bind(&self.addr).await {
+                        Ok(bound) => {
+                            listener = Some(bound);
+                            println!("EdgeGateway listening on {}", self.addr);
+                            break;
+                        }
+                        Err(err) => {
+                            eprintln!("EdgeGateway rebind failed: {:?}", err);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+                if listener.is_none() {
+                    continue;
+                }
+            }
+
+            // ### 修改记录 (2026-03-15)
+            // - 原因: 需要在 accept 阻塞时响应 draining 切换
+            // - 目的: 及时中断 accept 进入排空流程
+            let notify = self.drain_notify.notified();
+            let (socket, _) = tokio::select! {
+                _ = notify => {
+                    continue;
+                }
+                accepted = listener.as_ref().unwrap().accept() => {
+                    accepted?
+                }
+            };
 
             // ### 修改记录 (2026-03-01)
             // - 原因: 需要限制并发连接数

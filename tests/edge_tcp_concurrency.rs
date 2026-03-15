@@ -4,6 +4,8 @@ use check_program::hub::protocol::{
     MSG_TYPE_AUTH_HELLO, MSG_TYPE_RESPONSE, MSG_TYPE_SESSION_REQUEST,
 };
 use serde_json::Value;
+use tokio::net::TcpStream;
+use tokio::time::Duration;
 
 mod edge_tcp_common;
 use edge_tcp_common::{
@@ -70,12 +72,50 @@ async fn edge_tcp_allows_parallel_sessions() -> Result<()> {
 // - 原因: 需要先用 TDD 引入排空回归测试的占位调用
 // - 目的: 让后续新增的 spawn_gateway_with_handle 在编译期被强约束
 // - 备注: 该测试会先失败，作为实现前的 RED 阶段
+// - 追加: 进入实现阶段后，用连接失败断言替换占位逻辑
 #[tokio::test]
 async fn edge_tcp_draining_rejects_connect_then_allows_after_resume() -> Result<()> {
     // ### 修改记录 (2026-03-15)
     // - 原因: 排空测试需要能直接控制网关 draining 状态
     // - 目的: 暴露网关句柄以便后续测试逻辑挂接
-    // - 备注: 当前仅占位，等待 helper 实现
-    let (_addr, _gateway, _handle) = spawn_gateway_with_handle().await?;
+    // - 备注: 真实回归测试需要验证 connect 直接失败（A 判定）
+    let (addr, gateway, handle) = spawn_gateway_with_handle().await?;
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 排空状态切换需要同步给网关主循环
+    // - 目的: 保证后续 connect 行为可重现失败
+    gateway.set_draining(true);
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 允许运行循环感知 draining 并关闭监听
+    // - 目的: 避免测试因为时序过早而误判
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for _ in 0..5 {
+        // ### 修改记录 (2026-03-15)
+        // - 原因: A 判定要求 connect 直接失败
+        // - 目的: 约束排空期间不能建立 TCP 连接
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            TcpStream::connect(&addr),
+        )
+        .await;
+        // ### 修改记录 (2026-03-15)
+        // - 原因: 部分系统在无监听时会表现为连接超时
+        // - 目的: 将 timeout 视为 connect 失败的一种形式，避免误报
+        match result {
+            Ok(Ok(_stream)) => {
+                return Err(anyhow!("connect should fail while draining"));
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ### 修改记录 (2026-03-15)
+    // - 原因: 排空结束后需要恢复连接能力
+    // - 目的: 验证关闭监听后仍可重新 bind
+    gateway.set_draining(false);
+    let _stream = connect_with_retry(&addr).await?;
+    handle.abort();
     Ok(())
 }
