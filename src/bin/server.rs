@@ -391,8 +391,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match args.engine.as_str() {
         "sqlite" => {
             let raft_router = RaftRouter::new();
-            let raft_node = RaftNode::start(1, std::path::PathBuf::from(db_path), raft_router.clone())
-                .await?;
+            // ### 修改记录 (2026-03-15)
+            // - 原因: 生产路径需要切换到 gRPC 网络
+            // - 目的: 使用 start_grpc 启动 Raft 节点
+            let raft_node = RaftNode::start_grpc(1, std::path::PathBuf::from(db_path)).await?;
             raft_router.register(1, Arc::new(raft_node.clone()));
             let router = Arc::new(Router::new_with_raft(raft_node.clone()));
             let baseline = ClusterBaseline {
